@@ -1,38 +1,86 @@
-<#
+﻿<#
 .SYNOPSIS
-    霜刃 FrostBlade v1.0 Beta - 纯绿化单文件磁盘清理工具 (Win7+ / PS2.0+)
-    定位：面向个人电脑用户的轻量级磁盘清理工具。清理项含较多启发式判断与不可逆操作，不建议在企业/生产环境中运行，请自行评估风险后使用。
+    霜刃 FrostBlade v1.0 - 纯绿化单文件磁盘清理工具
+    定位：面向个人电脑用户的轻量级磁盘清理工具。清理项含较多启发式判断与不可逆操作，
+    不建议在企业/生产环境中批量部署或无人值守运行，请自行评估风险后使用。
 
-    核心能力：
-    1. [零依赖] 彻底剥离 JSON，规则通过原生 Hashtable 内嵌内存，不产生任何配置文件残留。
-    2. [内存管理] 修复 Runspace 重复执行时的底层内存泄漏，引入严格的 Dispose() 回收。
-    3. [性能优化] 废弃数组 += 操作，全链路应用 [System.Collections.Generic.List[string]]。
-    4. [双轨降级] 卷影清理自动侦测 CIM/WMI 接口，适配 Win10/11 的 PowerShell 7 环境。
-    5. [日志追踪] 拦截异常捕捉(Catch)，文件占用信息实时写入内存日志缓冲，并支持导出。
-
-    清理彻底度专项修复：
-    6. [核心bug修复] SafeClean 不再因管道中单个被占用文件而整体中断，逐项独立处理。
-    7. [删除兜底] 新增 robocopy /MIR /XJ 镜像清空法（兼容超长路径、跳过软链接），配合手动栈式残留核查 + Remove-ItemRobust，删不掉的锁定文件转 MoveFileEx，计划在下次重启时自动清除（PendingFileRenameOperations）。
-    8. [VSS兜底] CIM/WMI 卷影清理失败时自动转用 vssadmin 命令行兜底。
-    9. [权限兜底] Windows.old / $WINDOWS.~BT / ~WS 清理前自动 takeown + icacls 取所有权。
-    10.[覆盖面] 显卡着色器缓存补全 NVIDIA(DXCache/GLCache)、AMD(DxCache/VkCache)、Intel 路径。
-    11.[可选项] 新增「清理前自动关闭占用进程」勾选项（默认关闭，需用户主动开启+二次确认），可显著提升微信/QQ/浏览器等正在运行时的缓存清理彻底度。
+    核心特性：
+    - 零依赖：清理规则以原生 Hashtable 内嵌内存，不产生任何配置文件残留。
+    - 扫描/清理均在独立 Runspace 中异步执行，严格 Dispose() 回收，避免重复运行时内存泄漏。
+    - 卷影(VSS)清理自动在 CIM/WMI 与 vssadmin 命令行之间降级；日志实时写入内存缓冲并支持导出。
+    - 删除分级兜底：SafeClean 单文件占用不影响同批其余文件 -> robocopy /MIR /XJ 镜像清空
+      （兼容超长路径、跳过软链接）-> 仍删不掉的锁定文件转 MoveFileEx 计划重启删除。
+    - Windows.old / $WINDOWS.~BT / ~WS 等系统级目录清理前自动 takeown + icacls 取所有权。
+    - 显卡着色器缓存覆盖 NVIDIA(DXCache/GLCache)、AMD(DxCache/VkCache)、Intel 路径。
+    - 可选「清理前自动关闭占用进程」（默认关闭，需用户主动开启+二次确认），提升微信/QQ/
+      浏览器等正在运行时的缓存清理彻底度。
+    - 「已卸载软件残留目录」为启发式识别，存在误判可能，请清理前逐项核对。
+    - 支持 -Silent 静默模式，参数与退出码约定见 param() 定义及后文"静默执行流"部分。
+    - 异常兜底：脚本级 trap + WinForms Application.ThreadException 双重捕获未处理异常，
+      命中后尽量把运行日志落盘到系统临时目录，而不是让用户看到裸露的报错栈。
+    - 回收站支持「按删除时间选择性清理」（3/6/12 个月），默认仍为全部清空，向后兼容。
 #>
 param(
     [switch]$Silent = $false,
-    # 以下两个开关仅在 -Silent 模式下生效，分别对应 GUI 里的「清理前自动创建系统还原点」
-    # 与「清理前自动关闭占用进程」两个勾选框。GUI 默认二者均不勾选（见 $RestorePointChk / $AutoCloseChk
-    # 定义处 .Checked = $false），静默模式为保持行为一致，默认同样不开启，需要显式传参才会执行，
-    # 避免"静默=更激进"这种和 GUI 默认行为不一致、容易让用户措手不及的结果。
-    [switch]$CreateRestorePoint = $false,
-    [switch]$ClosePrograms = $false
+    # 以下参数仅在 -Silent 下生效，默认值均与 GUI 未勾选时的行为保持一致：
+    [switch]$CreateRestorePoint = $false,   # 清理前自动创建系统还原点
+    [switch]$ClosePrograms = $false,        # 清理前自动关闭占用进程
+    [int]$RecycleBinMonths = 0,             # 回收站清理范围：0=全部清空；N(>0)=仅清理N个月前删除的项目
+    [string]$LogFile = $null                # 运行日志追加写入到该文件，便于配合计划任务排查
 )
 
-# ==========================================
+# =====================================================================
 # 0. 权限提升与全局配置
-# ==========================================
+# =====================================================================
 $ConfirmPreference = 'None'
 $ErrorActionPreference = 'Continue'
+
+# ---------------------------------------------------------------------
+# 顶层异常兜底 (trap)：捕获主线程未被 try/catch 处理的终止性错误，避免用户看到裸露的报错栈。
+# 命中后尽量落盘运行日志；静默模式打印错误并以退出码 1 退出，交互模式弹出统一风格的错误框。
+# 注意：Runspace($ScanScriptBlock/$CleanScriptBlock) 内部异常已在各自 try/catch 中处理，
+#       不会传导到这里；GUI 事件回调异常由下方 Application.ThreadException 单独兜底。
+# ---------------------------------------------------------------------
+function Save-FrostBladeCrashLog([string]$ErrorMessage, [string]$ScriptLine) {
+    # 落盘动作本身也套一层 try，避免"想保存崩溃日志"这个动作自己又抛异常、把兜底逻辑也搞崩。
+    try {
+        $crashLines = New-Object System.Collections.Generic.List[string]
+        [void]$crashLines.Add("霜刃 FrostBlade 崩溃日志")
+        [void]$crashLines.Add("时间: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')")
+        [void]$crashLines.Add("错误: $ErrorMessage (脚本行号: $ScriptLine)")
+        [void]$crashLines.Add("----- 运行日志（如有） -----")
+        if ($Global:SyncHash -and $Global:SyncHash.FullLogHistory -and $Global:SyncHash.FullLogHistory.Count -gt 0) {
+            foreach ($l in $Global:SyncHash.FullLogHistory) { [void]$crashLines.Add($l) }
+        } else {
+            [void]$crashLines.Add("(崩溃发生时尚未产生运行日志，或日志系统本身还未初始化)")
+        }
+        $crashPath = Join-Path $env:TEMP ("FrostBlade_崩溃日志_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt")
+        [System.IO.File]::WriteAllLines($crashPath, $crashLines)
+        return $crashPath
+    } catch {
+        return $null
+    }
+}
+
+trap {
+    $errMsg  = $_.Exception.Message
+    $errLine = $_.InvocationInfo.ScriptLineNumber
+    $crashPath = Save-FrostBladeCrashLog -ErrorMessage $errMsg -ScriptLine $errLine
+
+    if ($Silent) {
+        Write-Host "[FrostBlade][致命错误] $errMsg (行 $errLine)" -ForegroundColor Red
+        if ($crashPath) { Write-Host "[FrostBlade] 已保存崩溃日志: $crashPath" -ForegroundColor Yellow }
+        exit 1
+    } else {
+        try {
+            $msg = "程序运行时发生未处理的错误，已尽量保存运行日志方便排查。`r`n`r`n错误信息: $errMsg`r`n(脚本行号: $errLine)"
+            if ($crashPath) { $msg += "`r`n`r`n崩溃日志已保存到:`r`n$crashPath" }
+            [System.Windows.Forms.MessageBox]::Show($msg, "霜刃 FrostBlade - 发生错误", "OK", "Error") | Out-Null
+        } catch { }
+        exit 1
+    }
+    break
+}
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
@@ -50,16 +98,22 @@ Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName Microsoft.VisualBasic
 [System.Windows.Forms.Application]::EnableVisualStyles()
 
-# =====================================================================
-# 模块 01-WinAPI : 原生 API 封装 (C# Add-Type)
-# 职责：MoveFileEx(延迟删除)/SHEmptyRecycleBin/SHQueryRecycleBin/高速递归测目录大小。
-# 依赖：无。供 05-ScanEngine、06-CleanEngine 调用。
-# =====================================================================
+# WinForms 事件回调异常兜底：按钮点击等消息循环回调不在 trap 覆盖范围内，需用
+# ThreadException 机制接住，否则异常会被吞掉或导致界面卡死。须在 ShowDialog()/Run() 之前设置。
+[System.Windows.Forms.Application]::SetUnhandledExceptionMode([System.Windows.Forms.UnhandledExceptionMode]::CatchException)
+[System.Windows.Forms.Application]::add_ThreadException({
+    param($senderObj, $threadExArgs)
+    $exMsg = $threadExArgs.Exception.Message
+    $crashPath = Save-FrostBladeCrashLog -ErrorMessage $exMsg -ScriptLine "GUI事件回调(非主线程序号)"
+    $msg = "界面操作时发生了一个未处理的错误，已尽量保存运行日志。`r`n`r`n错误信息: $exMsg"
+    if ($crashPath) { $msg += "`r`n`r`n崩溃日志已保存到:`r`n$crashPath" }
+    try { [System.Windows.Forms.MessageBox]::Show($msg, "霜刃 FrostBlade - 界面发生错误", "OK", "Error") | Out-Null } catch { }
+})
 
-
-# ==========================================
-# 1. C# 辅助类 (常驻内存，底层提速，抗权限报错)
-# ==========================================
+# =====================================================================
+# 1. WinAPI 原生接口封装 (C# Add-Type，常驻内存，底层提速/抗权限报错)
+#    提供：MoveFileEx(计划重启删除) / SHEmptyRecycleBin / SHQueryRecycleBin / 高速递归测目录大小
+# =====================================================================
 $Win32APICode = @"
 using System;
 using System.IO;
@@ -98,6 +152,37 @@ public static long GetRecycleBinTotalSize(string driveRoot) {
     int hr = SHQueryRecycleBin(driveRoot, ref info);
     return (hr == 0) ? info.i64Size : 0;
 }
+
+// --- 回收站"选择性清理"用的逐项静默强删（Remove-Item 失败时的兜底路径）---
+// 只删除已在回收站里的项目，故不带 FOF_ALLOWUNDO（否则等于"再扔回收站一次"，删了等于没删）。
+[StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto, Pack = 1)]
+public struct SHFILEOPSTRUCT {
+    public IntPtr hwnd;
+    public int wFunc;
+    public string pFrom;
+    public string pTo;
+    public short fFlags;
+    public bool fAnyOperationsAborted;
+    public IntPtr hNameMappings;
+    public string lpszProgressTitle;
+}
+
+[DllImport("shell32.dll", CharSet = CharSet.Auto)]
+public static extern int SHFileOperation(ref SHFILEOPSTRUCT FileOp);
+
+const int FO_DELETE = 3;
+const short FOF_SILENT = 4;             // 不显示进度条 UI
+const short FOF_NOCONFIRMATION = 16;    // 不弹确认框（避免 -Silent/后台线程卡在等用户点是）
+const short FOF_NOERRORUI = 1024;       // 出错不弹错误提示框
+
+public static int SHFileOperationDeleteSilent(string path) {
+    SHFILEOPSTRUCT fileOp = new SHFILEOPSTRUCT();
+    fileOp.wFunc = FO_DELETE;
+    // pFrom 必须是双重 null 结尾的字符串（哪怕只删一项也不例外），这是 SHFileOperation 的固定要求
+    fileOp.pFrom = path + '\0' + '\0';
+    fileOp.fFlags = (short)(FOF_SILENT | FOF_NOCONFIRMATION | FOF_NOERRORUI);
+    return SHFileOperation(ref fileOp);
+}
 }
 "@
 
@@ -107,45 +192,37 @@ if (-not ("FrostBladeWinAPI_v1" -as [type])) {
 
 
 # =====================================================================
-# 模块 02-Rules : 清理规则数据 (纯数据，无逻辑)
-# 职责：内置软件缓存路径规则库 BuiltInRules；清理前可选关闭的进程映射表 ProcessCloseMap。
-# 依赖：无。这是全脚本里改动频率最高的文件——新增一个软件的缓存规则只需要改这里。
-# 约定：本文件只允许出现数据字面量，不允许出现函数/控件/IO 调用，
-#       以保证"加一条规则"的 PR 永远不会牵扯到扫描/清理/GUI 逻辑。
+# 2. 清理规则库与进程映射表 (纯数据，无逻辑；新增一条软件规则只需要改这里)
 # =====================================================================
-
-# ==========================================
-# 2. 内置规则库 (彻底绿化，零 JSON 依赖)
-# ==========================================
 $Global:BuiltInRules = @{
     "SoftwareRules" = @(
         # --- 核心社交与办公 ---
-        @{ ID="WeChat"; RegKeys=@("wechat", "微信"); Paths=@("*\AppData\Roaming\Tencent\WeChat\XPlugin\Plugins\*\Cache", "*\Documents\WeChat Files\*\FileStorage\Cache", "*\Documents\WeChat Files\*\FileStorage\Temp", "*\Documents\xwechat_files\*\FileStorage\Cache", "*\Documents\xwechat_files\*\FileStorage\Temp") },
-        @{ ID="TencentQQ"; RegKeys=@("qq", "tencent"); Paths=@("*\AppData\Roaming\Tencent\QQ\Temp", "*\AppData\Roaming\Tencent\QQ\CrashDump", "*\AppData\Roaming\Tencent\QQ\*\AppData\file\cache") },
-        @{ ID="TencentQQNT"; RegKeys=@("qqnt"); Paths=@("*\AppData\Roaming\Tencent\QQNT\Cache", "*\AppData\Roaming\Tencent\QQNT\Logs", "*\AppData\Roaming\Tencent\QQNT\historylog", "*\AppData\Local\Tencent\QQNT\Cache") },
-        @{ ID="DingTalk"; RegKeys=@("dingtalk", "钉钉"); Paths=@("*\AppData\Roaming\DingTalk\*\Cache", "*\AppData\Roaming\DingTalk\*\cef_cache") },
-        @{ ID="WXWork"; RegKeys=@("wxwork", "企业微信"); Paths=@("*\Documents\WXWork\*\Cache", "*\Documents\WXWork\*\Temp") },
-        @{ ID="Feishu"; RegKeys=@("feishu", "飞书"); Paths=@("*\AppData\Local\Feishu\*\Cache", "*\AppData\Local\Feishu\*\Code Cache") },
-        @{ ID="TencentMeeting"; RegKeys=@("wemeet", "腾讯会议"); Paths=@("*\AppData\Local\Tencent\WeMeet\Cache", "*\AppData\Local\Tencent\WeMeet\Log") },
-        @{ ID="MSTeamsClassic"; RegKeys=@("teams"); Paths=@("*\AppData\Roaming\Microsoft\Teams\Cache", "*\AppData\Roaming\Microsoft\Teams\Code Cache", "*\AppData\Roaming\Microsoft\Teams\GPUCache", "*\AppData\Roaming\Microsoft\Teams\blob_storage", "*\AppData\Roaming\Microsoft\Teams\Service Worker\CacheStorage") },
-        @{ ID="MSTeamsNew"; RegKeys=@("teams"); Paths=@("*\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Cache", "*\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\Cache") },
-        @{ ID="Slack"; RegKeys=@("slack"); Paths=@("*\AppData\Roaming\Slack\Cache", "*\AppData\Roaming\Slack\Code Cache", "*\AppData\Roaming\Slack\GPUCache", "*\AppData\Roaming\Slack\Service Worker\CacheStorage") },
-        @{ ID="Zoom"; RegKeys=@("zoom"); Paths=@("*\AppData\Roaming\Zoom\data\Cache", "*\AppData\Roaming\Zoom\logs") },
-        @{ ID="iQiyi"; RegKeys=@("iqiyi", "爱奇艺"); Paths=@("*\AppData\Local\IQIYI Video\LStyle\Cache", "*\AppData\Roaming\IQIYI Video\LStyle\Dump") },
-        @{ ID="Bilibili"; RegKeys=@("bilibili", "哔哩哔哩"); Paths=@("*\AppData\Roaming\bilibili\Cache", "*\AppData\Roaming\bilibili\cef_cache", "*\AppData\Roaming\bilibili\logs") },
-        @{ ID="TencentVideo"; RegKeys=@("qqlive", "腾讯视频"); Paths=@("*\AppData\Local\Tencent\TencentVideo\Download", "*\AppData\Local\Tencent\QQLive\*\Cache") },
-        @{ ID="Youku"; RegKeys=@("youku", "优酷"); Paths=@("*\AppData\Roaming\Youku\*\Cache", "*\AppData\Roaming\Youku\*\cef_cache", "*\AppData\Local\Youku\*\Cache") },
-        @{ ID="Tudou"; RegKeys=@("tudou", "土豆"); Paths=@("*\AppData\Roaming\Tudou\*\Cache", "*\AppData\Roaming\Tudou\*\cef_cache") },
-        @{ ID="NetEaseMusic"; RegKeys=@("cloudmusic", "网易云音乐"); Paths=@("*\AppData\Local\Netease\CloudMusic\Cache", "*\AppData\Local\Netease\CloudMusic\webdata\file\cache") },
-        @{ ID="KuGou"; RegKeys=@("kugou", "酷狗"); Paths=@("*\AppData\Roaming\Kugou*\Cache", "*\AppData\Roaming\Kugou*\Temp", "*\AppData\Roaming\Kugou*\cef_cache", "*\AppData\Local\Kugou*\Cache") },
-        @{ ID="Kuwo"; RegKeys=@("kuwo", "酷我"); Paths=@("*\AppData\Roaming\Kuwo*\Cache", "*\AppData\Roaming\Kuwo*\Temp", "*\AppData\Roaming\Kuwo*\cef_cache", "*\AppData\Local\Kuwo*\Cache") },
-        @{ ID="Spotify"; RegKeys=@("spotify"); Paths=@("*\AppData\Local\Spotify\Browser\Cache", "*\AppData\Local\Spotify\Storage") },
-        @{ ID="Thunder"; RegKeys=@("thunder", "迅雷"); Paths=@("C:\Users\Public\Thunder Network\*\Cache", "*\AppData\LocalLow\Thunder Network\*\Cache") },
-        @{ ID="BaiduNetdisk"; RegKeys=@("baidunetdisk", "百度网盘"); Paths=@("*\AppData\Roaming\baidu\BaiduNetdisk\Cache", "*\AppData\Roaming\baidu\BaiduNetdisk\Crashpad\reports", "*\AppData\Roaming\baidu\BaiduNetdisk\logs") },
-        @{ ID="Steam"; RegKeys=@("steam"); Paths=@("*\AppData\Local\Steam\htmlcache\Cache", "*\AppData\Local\Steam\htmlcache\Code Cache") },
-        @{ ID="VSCode"; RegKeys=@("vscode", "visual studio code"); Paths=@("*\AppData\Roaming\Code\Cache", "*\AppData\Roaming\Code\CachedData", "*\AppData\Roaming\Code\Code Cache") },
-        @{ ID="Discord"; RegKeys=@("discord"); Paths=@("*\AppData\Roaming\discord\Cache", "*\AppData\Roaming\discord\Code Cache") },
-        @{ ID="WPS"; RegKeys=@("wps", "kingsoft"); Paths=@("*\AppData\Local\Kingsoft\WPS Office\*\cache", "*\AppData\Roaming\kingsoft\wps\addons\cef\cache") }
+        @{ ID="WeChat"; Paths=@("*\AppData\Roaming\Tencent\WeChat\XPlugin\Plugins\*\Cache", "*\Documents\WeChat Files\*\FileStorage\Cache", "*\Documents\WeChat Files\*\FileStorage\Temp", "*\Documents\xwechat_files\*\FileStorage\Cache", "*\Documents\xwechat_files\*\FileStorage\Temp") },
+        @{ ID="TencentQQ"; Paths=@("*\AppData\Roaming\Tencent\QQ\Temp", "*\AppData\Roaming\Tencent\QQ\CrashDump", "*\AppData\Roaming\Tencent\QQ\*\AppData\file\cache") },
+        @{ ID="TencentQQNT"; Paths=@("*\AppData\Roaming\Tencent\QQNT\Cache", "*\AppData\Roaming\Tencent\QQNT\Logs", "*\AppData\Roaming\Tencent\QQNT\historylog", "*\AppData\Local\Tencent\QQNT\Cache") },
+        @{ ID="DingTalk"; Paths=@("*\AppData\Roaming\DingTalk\*\Cache", "*\AppData\Roaming\DingTalk\*\cef_cache") },
+        @{ ID="WXWork"; Paths=@("*\Documents\WXWork\*\Cache", "*\Documents\WXWork\*\Temp") },
+        @{ ID="Feishu"; Paths=@("*\AppData\Local\Feishu\*\Cache", "*\AppData\Local\Feishu\*\Code Cache") },
+        @{ ID="TencentMeeting"; Paths=@("*\AppData\Local\Tencent\WeMeet\Cache", "*\AppData\Local\Tencent\WeMeet\Log") },
+        @{ ID="MSTeamsClassic"; Paths=@("*\AppData\Roaming\Microsoft\Teams\Cache", "*\AppData\Roaming\Microsoft\Teams\Code Cache", "*\AppData\Roaming\Microsoft\Teams\GPUCache", "*\AppData\Roaming\Microsoft\Teams\blob_storage", "*\AppData\Roaming\Microsoft\Teams\Service Worker\CacheStorage") },
+        @{ ID="MSTeamsNew"; Paths=@("*\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\Cache", "*\AppData\Local\Packages\MSTeams_8wekyb3d8bbwe\LocalCache\Microsoft\MSTeams\EBWebView\Cache") },
+        @{ ID="Slack"; Paths=@("*\AppData\Roaming\Slack\Cache", "*\AppData\Roaming\Slack\Code Cache", "*\AppData\Roaming\Slack\GPUCache", "*\AppData\Roaming\Slack\Service Worker\CacheStorage") },
+        @{ ID="Zoom"; Paths=@("*\AppData\Roaming\Zoom\data\Cache", "*\AppData\Roaming\Zoom\logs") },
+        @{ ID="iQiyi"; Paths=@("*\AppData\Local\IQIYI Video\LStyle\Cache", "*\AppData\Roaming\IQIYI Video\LStyle\Dump") },
+        @{ ID="Bilibili"; Paths=@("*\AppData\Roaming\bilibili\Cache", "*\AppData\Roaming\bilibili\cef_cache", "*\AppData\Roaming\bilibili\logs") },
+        @{ ID="TencentVideo"; Paths=@("*\AppData\Local\Tencent\TencentVideo\Download", "*\AppData\Local\Tencent\QQLive\*\Cache") },
+        @{ ID="Youku"; Paths=@("*\AppData\Roaming\Youku\*\Cache", "*\AppData\Roaming\Youku\*\cef_cache", "*\AppData\Local\Youku\*\Cache") },
+        @{ ID="Tudou"; Paths=@("*\AppData\Roaming\Tudou\*\Cache", "*\AppData\Roaming\Tudou\*\cef_cache") },
+        @{ ID="NetEaseMusic"; Paths=@("*\AppData\Local\Netease\CloudMusic\Cache", "*\AppData\Local\Netease\CloudMusic\webdata\file\cache") },
+        @{ ID="KuGou"; Paths=@("*\AppData\Roaming\Kugou*\Cache", "*\AppData\Roaming\Kugou*\Temp", "*\AppData\Roaming\Kugou*\cef_cache", "*\AppData\Local\Kugou*\Cache") },
+        @{ ID="Kuwo"; Paths=@("*\AppData\Roaming\Kuwo*\Cache", "*\AppData\Roaming\Kuwo*\Temp", "*\AppData\Roaming\Kuwo*\cef_cache", "*\AppData\Local\Kuwo*\Cache") },
+        @{ ID="Spotify"; Paths=@("*\AppData\Local\Spotify\Browser\Cache", "*\AppData\Local\Spotify\Storage") },
+        @{ ID="Thunder"; Paths=@("C:\Users\Public\Thunder Network\*\Cache", "*\AppData\LocalLow\Thunder Network\*\Cache") },
+        @{ ID="BaiduNetdisk"; Paths=@("*\AppData\Roaming\baidu\BaiduNetdisk\Cache", "*\AppData\Roaming\baidu\BaiduNetdisk\Crashpad\reports", "*\AppData\Roaming\baidu\BaiduNetdisk\logs") },
+        @{ ID="Steam"; Paths=@("*\AppData\Local\Steam\htmlcache\Cache", "*\AppData\Local\Steam\htmlcache\Code Cache") },
+        @{ ID="VSCode"; Paths=@("*\AppData\Roaming\Code\Cache", "*\AppData\Roaming\Code\CachedData", "*\AppData\Roaming\Code\Code Cache") },
+        @{ ID="Discord"; Paths=@("*\AppData\Roaming\discord\Cache", "*\AppData\Roaming\discord\Code Cache") },
+        @{ ID="WPS"; Paths=@("*\AppData\Local\Kingsoft\WPS Office\*\cache", "*\AppData\Roaming\kingsoft\wps\addons\cef\cache") }
     )
     "WeChatMediaPaths" = @(
         "*\Documents\WeChat Files\*\FileStorage\Video", "*\Documents\WeChat Files\*\FileStorage\Image", "*\Documents\WeChat Files\*\FileStorage\File", "*\Documents\WeChat Files\*\FileStorage\MsgAttach",
@@ -153,11 +230,7 @@ $Global:BuiltInRules = @{
     )
 }
 
-# ==========================================
-# 2.5 [增强] 「清理前自动关闭占用进程」映射表
-#     默认不启用，由用户在主界面手动勾选后才会生效；
-#     仅在对应扫描项被勾选清理时，才会尝试关闭表中列出的进程。
-# ==========================================
+# --- 「清理前自动关闭占用进程」映射表：默认不启用，仅在对应扫描项被勾选清理时生效 ---
 $Global:ProcessCloseMap = @{
     "BrowserCache"  = @("chrome", "msedge", "firefox", "opera", "opera_gx", "brave", "vivaldi",
                          "360se", "360chrome", "QQBrowser", "SogouExplorer", "Maxthon", "HuaweiBrowser")
@@ -170,15 +243,8 @@ $Global:ProcessCloseMap = @{
 
 
 # =====================================================================
-# 模块 03-ScanState : 扫描项清单与线程安全共享状态
-# 职责：ScanItems 清单定义、HighRiskKeys/PreviewRequiredKeys 统一高危清单、
-#       SyncHash（跨 Runspace 通信对象）初始化、Get-FixedDriveLetters。
-# 依赖：02-Rules（把 BuiltInRules 挂进 SyncHash）。
+# 3. 扫描清单与线程安全通信对象 (ScanItems / SyncHash)
 # =====================================================================
-
-# ==========================================
-# 3. 扫描清单与线程安全通信对象 (SyncHash)
-# ==========================================
 $Global:ScanItems = @{
     # --- 第一梯队：安全必清 (零风险·自动重建·官方推荐默认勾选) ---
     "SystemTemp"         = @{ Name = "系统临时文件 (Temp/Prefetch)";          Checked = $true;  Size = 0; Paths = @() }
@@ -220,15 +286,13 @@ $Global:ScanItems = @{
     "WinSxSResetBase"    = @{ Name = "WinSxS 深度压缩 /ResetBase (高危·不可逆·清后无法回滚更新)"; Checked = $false; Size = 0; Paths = @() }
 }
 
-# [新增] Stale 标记：$true 表示"该项尚未在勾选状态下被完整扫描过一次"，用于清理前的
-# 「所见即所得」校验——防止用户在扫描完成后才勾选某一项、没有重新扫描就直接点"执行深度清理"，
-# 结果这一项因为从没被扫描过而 Paths 是空的，静默什么都没清理，用户却以为已经处理了。
-# 复选框每次被勾选（Add_CheckedChanged）都会把对应项标记为 Stale，只有真正跑完一次"深度扫描
-# 分析"（该项当时处于勾选状态）才会被扫描引擎清掉这个标记，详见 05-ScanEngine.ps1 / 07-Gui.ps1。
+# Stale：$true 表示"该项尚未在勾选状态下被完整扫描过一次"。防止用户扫描完成后才勾选某项、
+# 未重新扫描就直接清理导致 Paths 为空、静默跳过却让用户误以为已处理。勾选框变更（Add_CheckedChanged）
+# 会置为 Stale，只有该项在勾选状态下跑完一次扫描才会被扫描引擎清掉。
 foreach ($k in $Global:ScanItems.Keys) { $Global:ScanItems[$k].Stale = $true }
 
-# [重排] 顺序已按"必要性从高到低、风险从低到高"重新排列，与上方 ScanItems 三梯队定义保持一致，
-# 使 GUI 勾选框列表自上而下呈现"越靠上越该清、越靠下越要谨慎"的直观顺序。
+# 顺序按"必要性从高到低、风险从低到高"排列，与上方 ScanItems 三梯队定义一致，
+# 使 GUI 勾选框列表自上而下呈现"越靠上越该清、越靠下越要谨慎"。
 $KeyList = @(
     # 第一梯队：安全必清
     "SystemTemp", "UserTemp", "WinUpdate", "DeliveryOpt", "BrowserCache", "ThumbCache", "D3DSCache",
@@ -241,11 +305,10 @@ $KeyList = @(
     "QQChatImages", "WeChatMedia", "WindowsOld", "VSSShadow", "WinSxSResetBase"
 )
 
-# [新增] 高危/需人工复核项统一清单：红色标记 + "全选"按钮跳过 + 是否需要清理前预览确认，三处共用同一份定义，
-# 避免像之前那样在多处各写一份硬编码数组导致漏改不同步（例如 ResidualAppDirs 曾经只在默认值里改了却漏了红色标记）。
+# 高危/需人工复核项统一清单：红色标记 + "全选"跳过 + 是否需要清理前预览确认，三处共用，避免各处硬编码不同步。
 $Global:HighRiskKeys = @("WeChatMedia", "QQChatImages", "VSSShadow", "WindowsOld", "EmptyFolders", "EventLogs",
                           "WinSxSResetBase", "HibernateFile", "CompactOS", "ResidualAppDirs")
-# 需要在真正删除前弹出逐项勾选预览的项（启发式判定、误判代价较高）
+# 删除前需逐项勾选预览确认的项（启发式判定、误判代价较高）
 $Global:PreviewRequiredKeys = @("ResidualAppDirs", "RegUninstall")
 
 $Global:SyncHash = [hashtable]::Synchronized(@{})
@@ -257,16 +320,16 @@ $Global:SyncHash.CancelRequested = $false
 $Global:SyncHash.ScanItems = $Global:ScanItems
 $Global:SyncHash.SystemDrive = $env:SystemDrive
 $Global:SyncHash.BuiltInRules = $Global:BuiltInRules
-# [新增] 残留目录逐项详情（路径+大小+最后写入时间），供清理前预览界面使用；
-# 不能只用 ScanItems.Paths（纯字符串数组），因为预览界面需要展示大小方便用户判断。
+# 残留目录逐项详情（路径+大小+最后写入时间），供清理前预览界面使用（ScanItems.Paths 仅为字符串数组，不带大小）
 $Global:SyncHash.ResidualDetails = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-# [新增] 注册表失效卸载项详情（显示名/注册表路径/记录的安装路径），供清理前预览界面使用。
-# RegUninstall 原来是直接删注册表项，没有预览：InstallLocation 为空、或路径暂时不可达（USB/网络驱动器离线）
-# 都可能被误判为"失效"，需要让用户逐项确认。
+# 注册表失效卸载项详情（显示名/注册表路径/安装路径），供清理前预览界面使用：
+# InstallLocation 为空、或路径暂时不可达（如 USB/网络驱动器离线）都可能被误判为"失效"，需用户逐项确认。
 $Global:SyncHash.RegUninstallDetails = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
-# [新增] 当"自动创建还原点"与"VSSShadow清理"冲突时，用户选择"仅本次跳过卷影清理"会设为 $true；
-# 不修改 ScanItems.VSSShadow.Checked 本身，避免误改用户下次运行时的勾选状态。
+# "自动创建还原点"与"VSSShadow清理"冲突时，用户选择"仅本次跳过卷影清理"会置为 $true；
+# 不修改 ScanItems.VSSShadow.Checked 本身，避免影响下次运行的勾选状态。
 $Global:SyncHash.SkipVSSThisRun = $false
+# 回收站清理范围：0=全部清空（默认，向后兼容）；N(>0)=仅清理 N 个月前删除的项目
+$Global:SyncHash.RecycleBinMonths = 0
 
 function Get-FixedDriveLetters {
     # 主线程版三轨降级（$ScanScriptBlock 内部还有一份给独立 Runspace 用的同款函数，互不共享，必须各定义一份）
@@ -287,14 +350,8 @@ function Get-FixedDriveLetters {
 
 
 # =====================================================================
-# 模块 04-LargeFileEngine : 大文件扫描子系统状态与后台脚本块
-# 职责：LFSync 通信对象、LargeFileScanBlock（独立于常规清理项的全盘体积扫描）。
-# 依赖：无（自包含，其内部按 Runspace 限制自带一份 Get-FixedDriveLetters 副本）。
+# 4. 大文件扫描引擎 (独立功能：全盘按体积扫描，命中后由用户手动勾选删除，不在常规清理项里)
 # =====================================================================
-
-# ==========================================
-# 3.5 大文件扫描引擎（独立功能：全盘按体积扫描，命中后由用户手动勾选删除，不在常规清理项里）
-# ==========================================
 $Global:LFSync = [hashtable]::Synchronized(@{})
 $Global:LFSync.IsRunning = $false
 $Global:LFSync.CancelRequested = $false
@@ -371,16 +428,13 @@ $LargeFileScanBlock = {
 
 
 # =====================================================================
-# 模块 05-ScanEngine : 异步后台深度扫描引擎 (ScriptBlock，运行于独立 Runspace)
-# 职责：遍历 03-ScanState 中勾选的扫描项，计算体积、收集路径，写入 SyncHash。
-# 依赖：01-WinAPI（GetDirectorySizeFast）、02-Rules（BuiltInRules）、03-ScanState（ScanItems 结构）。
-# 注意：Runspace 不继承父作用域函数表，本文件内的 Get-FixedDriveLetters 是主线程版的独立副本，
-#       如需修复该函数的 bug，请同时检查 03-ScanState.ps1 与 04-LargeFileEngine.ps1 是否也需要同步。
+# 5. 异步后台扫描引擎 (ScriptBlock，运行于独立 Runspace)
+#    遍历第 3 节中勾选的扫描项，计算体积、收集路径，写入 SyncHash。
+#    注意：Runspace 不继承父作用域函数表，Get-FixedDriveLetters 在本文件中共有两份独立副本
+#    （主线程版见第 3 节 334 行；本 Runspace 内的版本见下方，供本脚本块内所有小节共用，
+#    包括空文件夹扫描等小节——它们与本函数同处一个 Runspace 作用域，无需再各自定义一份）。
+#    修复其 bug 时两处都要同步。
 # =====================================================================
-
-# ==========================================
-# 4. 异步后台扫描引擎 (ScriptBlock)
-# ==========================================
 $ScanScriptBlock = {
     param($Sync)
 
@@ -411,9 +465,8 @@ $ScanScriptBlock = {
     Write-AsyncLog ">>> 后台深度扫描引擎启动 (Zero I/O) <<<"
     $Sync.Progress = 2
 
-    # [新增] 本轮扫描开始时，把当前处于勾选状态的项统一标记为"已被扫描覆盖"（清掉 Stale）。
-    # 这样即使某个类别扫描结果确实是 0（比如浏览器缓存本来就是空的），也能跟"从未扫描过"
-    # 区分开——前者 Stale=$false 是清理时安全的，后者 Stale=$true 会在点击"执行深度清理"时被拦下提醒。
+    # 本轮扫描开始时，把当前勾选状态的项统一清掉 Stale 标记，即使结果为 0（如浏览器缓存本就是空的）
+    # 也能与"从未扫描过"区分开——后者会在点击"执行深度清理"时被拦下提醒。
     [System.Threading.Monitor]::Enter($Sync)
     try {
         foreach ($k in $Sync.ScanItems.Keys) {
@@ -422,7 +475,31 @@ $ScanScriptBlock = {
     } finally { [System.Threading.Monitor]::Exit($Sync) }
 
     $usersRoot = "$($Sync.SystemDrive)\Users"
-    $userDirs = [System.IO.Directory]::GetDirectories($usersRoot)
+    # 过滤掉非真实用户档案目录：Public/Default/Default User 是系统模板/公共目录，不含真实用户的
+    # AppData 缓存；"All Users" 在新版 Windows 下是指向 $env:ProgramData 的联接点(Junction)，不过滤的话
+    # 会把 ProgramData 错当成"某个用户目录"重复拼一遍路径去探测，属于无意义的重复 Test-Path。
+    # -notcontains 是 PowerShell 1.0/2.0 就有的运算符（区别于 PS3.0+ 才有的 -notin），沿用与全文
+    # 一致的 PS2.0 兼容写法。外层套 @() 是必须的：Where-Object 管道只筛出 0/1 个结果时 PowerShell 会
+    # 自动"拆包"成单个字符串而不是数组，届时下方 $userDirs[0] 会变成对字符串取第 1 个字符，
+    # 而不是取第 1 个用户目录路径，导致 3.1/3.2 节里"绝对路径只在第一个用户目录下处理一次"的
+    # 去重逻辑失效（会给每个用户目录重复扫描一遍系统级绝对路径）。@() 强制结果始终是数组，避免这个坑。
+    $excludedUserDirNames = @("Public", "Default", "Default User", "All Users")
+    if (Test-Path -LiteralPath $usersRoot) {
+        $userDirs = @([System.IO.Directory]::GetDirectories($usersRoot) | Where-Object {
+            $dirName = [System.IO.Path]::GetFileName($_)
+            $isJunction = $false
+            try { $isJunction = ([System.IO.File]::GetAttributes($_) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 } catch { }
+            (-not $isJunction) -and ($excludedUserDirNames -notcontains $dirName)
+        })
+    } else {
+        # 正常 Windows 系统上 Users 目录必然存在；这里兜底是为了防止极少数非常规部署（用户目录被
+        # 迁移、SystemDrive 判断有误等）导致 GetDirectories 抛出未捕获异常、扫描 Runspace 提前终止——
+        # 那样会使 $Sync.IsRunning 永远停留在 $true（复位语句在脚本最末尾，走不到），GUI 侧表现为
+        # 卡在"扫描中"且没有任何报错提示，比直接报错更难排查。这里改为跳过按用户扫描的项目、
+        # 记录一行日志，让其余与用户目录无关的项（各盘 WinSxS、回收站等）能继续正常扫描完成。
+        Write-AsyncLog "  -> [警告] 未找到用户目录 $usersRoot，本次跳过所有按用户扫描的项目（浏览器缓存/微信缓存等）"
+        $userDirs = @()
+    }
     
     [System.Threading.Monitor]::Enter($Sync)
     try {
@@ -625,9 +702,8 @@ $ScanScriptBlock = {
                 foreach ($base in $finalQQBasePaths) {
                     [void]$softPathsList.Add("$base\Temp"); [void]$softPathsList.Add("$base\CrashDump")
                     [void]$softPathsList.Add("$base\*\AppData\file\cache")
-                    # [修复] "$base\*\Image" 和 "$base\*\CustomFace" 存放的是聊天中收发过的图片、自定义头像展示缓存，
-                    # 属于用户可见的聊天内容，不是纯技术缓存，不应该混进默认开启的"常用软件运行时缓存"里一键清理。
-                    # 已拆分为独立的 QQChatImages 项（默认关闭），见下方 3.1 小节。
+                    # "$base\*\Image"、"$base\*\CustomFace" 是聊天图片/自定义头像，属于用户可见内容，
+                    # 不是纯技术缓存，不混入默认开启的"常用软件运行时缓存"，已拆分为独立的 QQChatImages 项（见 3.1）。
                 }
                 Write-AsyncLog "  -> [QQ雷达] 注入 $($finalQQBasePaths.Count) 个动态基准路径"
             } elseif ($r.ID -eq "DingTalk") {
@@ -703,7 +779,7 @@ $ScanScriptBlock = {
         } finally { [System.Threading.Monitor]::Exit($Sync) }
     }
 
-    # --- 3.5 微信媒体深度文件（终极通用版）---
+    # --- 3.2 微信媒体深度文件（终极通用版）---
     if ($Sync.ScanItems["WeChatMedia"].Checked) {
         Write-AsyncLog "[探测] 启动微信媒体通用雷达..."
         $wxRootCandidates = New-Object System.Collections.Generic.List[string]
@@ -818,7 +894,7 @@ $ScanScriptBlock = {
         } finally { [System.Threading.Monitor]::Exit($Sync) }
     }
 
-    # --- 已卸载软件残留目录（残留目录）智能识别 ---
+    # --- 5. 已卸载软件残留目录（残留目录）智能识别 ---
     if ($Sync.ScanItems["ResidualAppDirs"].Checked) {
         Write-AsyncLog "[扫描] 已卸载软件残留目录（残留目录）识别中（多维度误判过滤）..."
 
@@ -936,9 +1012,8 @@ $ScanScriptBlock = {
         $residualTotal = [long]0
         # 90天内有文件写入 = 极可能仍在使用（绿化软件/破解软件都有活跃写入）
         $cutoffDate  = (Get-Date).AddDays(-90)
-        # [新增] 同名目录跨路径交叉核对用：activeNames 记录本次扫描中任意位置被判定为
-        # 活跃/含卸载器/进程占用/已知安装路径的目录名；pendingResiduals 暂存通过初筛但
-        # 尚未与 activeNames 核对过的候选残留目录，见下方 Step 4。
+        # 同名目录跨路径交叉核对：activeNames 记录本次扫描中被判定为活跃/含卸载器/进程占用/已知安装路径的目录名；
+        # pendingResiduals 暂存通过初筛但尚未与 activeNames 核对的候选残留目录（见 Step 4）。
         $activeNames    = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
         $pendingResiduals = New-Object System.Collections.Generic.List[object]
 
@@ -1040,7 +1115,8 @@ $ScanScriptBlock = {
         Write-AsyncLog ("[扫描完成] 残留目录共 {0} 个，合计 {1:N0} MB（已过滤近期活跃/含卸载器/进程占用/快捷方式匹配目录/同名目录交叉核对）" -f $residualDirs.Count, ($residualTotal/1MB))
     }
 
-    # --- WinSxS 组件存储大小预估（DISM /Online /Cleanup-Image /AnalyzeComponentStore） ---
+    # --- 6. 高危项体积探测：WinSxS / 休眠文件 / CompactOS ---
+    # 6.1 WinSxS 组件存储大小预估（DISM /Online /Cleanup-Image /AnalyzeComponentStore）
     if ($Sync.ScanItems["WinSxSClean"].Checked -or $Sync.ScanItems["WinSxSResetBase"].Checked) {
         Write-AsyncLog "[扫描] WinSxS 组件存储分析（DISM AnalyzeComponentStore，可能需要 30-90 秒）..."
         $winsxsPath = "$env:windir\WinSxS"
@@ -1072,10 +1148,8 @@ $ScanScriptBlock = {
             }
         } catch { Write-AsyncLog "  [DISM] 分析命令执行失败（DISM 不可用或权限不足）" }
 
-        # [修复] 严禁在 DISM 输出解析失败（正则未命中/命令超时/权限不足）时，用 WinSxS 目录物理总大小
-        # ($winsxsSize，现代 Windows 上普遍 5-10GB+) 兜底充当"可回收空间"上报给用户——那是完全不同的两个量，
-        # 会造成严重的虚高误报和视觉恐慌。此处未能取得明确可回收值时，强制按 0 处理，仅在日志里如实说明"未知"，
-        # 不再用总目录大小顶替。
+        # DISM 输出解析失败（正则未命中/命令超时/权限不足）时不用目录物理总大小（普遍 5-10GB+）顶替
+        # "可回收空间"上报——两者是完全不同的量，会造成虚高误报。未能取得明确值时按 0 处理，日志注明"未知"。
         $reportSize = if ($reclaimable -gt 0) { $reclaimable } else { [long]0 }
         [System.Threading.Monitor]::Enter($Sync)
         try {
@@ -1089,7 +1163,7 @@ $ScanScriptBlock = {
         }
     }
 
-    # --- 休眠文件大小检测 ---
+    # 6.2 休眠文件大小检测
     if ($Sync.ScanItems["HibernateFile"].Checked) {
         $hibPath = "$env:SystemDrive\hiberfil.sys"
         $hibSize = [long]0
@@ -1105,16 +1179,12 @@ $ScanScriptBlock = {
         }
     }
 
-    # --- Compact OS 状态检测 ---
+    # 6.3 Compact OS 状态检测
     if ($Sync.ScanItems["CompactOS"].Checked) {
-        # [修复] 原正则用 "compacted" 匹配英文回显，但 compact.exe /CompactOS:query 的三种真实英文回显
-        # ("...is not in the Compact state...", "...is in the Compact state...",
-        #  "...is not in the Compact state but may become compact as needed.") 里根本没有 "compacted" 这个词，
-        # 导致英文系统上该判定永远为 $false（一直误报"尚未压缩"）。改为顺序匹配"否定短语优先"的方式：
-        # 三句里两句"未压缩"都含 "not in the Compact"，先排除掉它们，剩下命中 "in the Compact state" 的
-        # 就只会是"已压缩"那一句；中文本地化文案未经逐一核实，同样按"先否定、后肯定"的顺序做尽量宽松的兜底匹配。
-        # 匹配不确定时保持 $false（即"当作尚未压缩去尝试压缩"）——因为 /CompactOS:always 本身是幂等操作，
-        # 对已压缩文件会自动跳过，误判成"尚未压缩"顶多是多花点时间重新核对，不会造成破坏，比误判成"已压缩"而漏掉真正需要压缩的系统更安全。
+        # compact.exe /CompactOS:query 的英文回显不含 "compacted" 一词，故按"先排除否定短语、
+        # 再匹配肯定短语"的顺序判定（"not in the Compact"优先排除，剩下命中"in the Compact state"才算已压缩），
+        # 中文本地化文案同理兜底匹配。匹配不确定时保持 $false：/CompactOS:always 是幂等操作，
+        # 误判成"尚未压缩"顶多重新核对一次，比漏掉真正需要压缩的系统更安全。
         $isCompacted = $false
         try {
             $compactOut = & compact.exe /CompactOS:query 2>&1
@@ -1146,13 +1216,12 @@ $ScanScriptBlock = {
     }
     $Sync.Progress = 70
 
-    # --- 5. 空文件夹收割（全盘递归扫描，增强版） ---
+    # --- 7. 空文件夹收割（全盘递归扫描，增强版） ---
     if ($Sync.ScanItems["EmptyFolders"].Checked) {
         Write-AsyncLog "[扫描] 全盘递归空文件夹收割（增强版，实时日志）..."
         $emptyFolders    = New-Object System.Collections.Generic.List[string]
-        # [修复] 原写法 "$env:ProgramFiles(x86)" 在双引号字符串中变量名解析会在左括号处截断，
-        # 实际展开为 "...Program Files(x86)"（缺一个空格），与真实目录 "Program Files (x86)" 不匹配，
-        # 导致该排除规则形同虚设。改用 ${env:...} 显式定界 + 逐项非空校验，确保排除真正生效。
+        # 用 ${env:ProgramFiles(x86)} 显式定界（普通 "$env:ProgramFiles(x86)" 在双引号字符串里
+        # 会在左括号处截断，导致排除规则形同虚设），并逐项非空校验。
         $excludePrefixes = New-Object System.Collections.Generic.List[string]
         foreach ($ep in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {
             if (-not [string]::IsNullOrEmpty($ep)) { [void]$excludePrefixes.Add($ep) }
@@ -1211,12 +1280,30 @@ $ScanScriptBlock = {
     }
     $Sync.Progress = 80
 
-    # --- 6. 核心杂项 ---
+    # --- 8. 核心杂项与其他探测 ---
     Write-AsyncLog "[扫描] 核心杂项与系统环境探测..."
 
     [System.Threading.Monitor]::Enter($Sync)
     try {
-        if ($Sync.ScanItems["DriverCache"].Checked) { $Sync.ScanItems["DriverCache"].Paths = @("$env:SystemDrive\NVIDIA", "$env:SystemDrive\AMD", "$env:ProgramData\NVIDIA Corporation\Downloader") | Where-Object { Test-Path $_ } }
+        if ($Sync.ScanItems["DriverCache"].Checked) {
+            # 覆盖面说明（已核实来源）：
+            #   - SystemDrive\NVIDIA / \AMD / \INTEL：三大厂商驱动安装程序在系统盘根目录下的解压暂存目录，
+            #     安装完成后即为纯粹残留，删除不影响已安装驱动和显卡功能（原有 NVIDIA/AMD 两项，新增 INTEL）。
+            #   - NVIDIA Corporation\Downloader：当前版本驱动下载缓存（原有）。
+            #   - NVIDIA Corporation\Installer2：历次驱动/组件安装包缓存，用于日后"驱动回滚"时重新拼装安装包，
+            #     常年只增不减，体积可达数 GB；只清空其内容、不删除 Installer2 目录本身
+            #     （与 SafeClean 只清空目录内容、不删除目录本身的行为天然吻合），删除内容不影响当前已装驱动，
+            #     但会导致今后驱动异常时无法用"回滚到上一版本"，只能重新下载安装——是可接受的代价。
+            #   - 未纳入 NVIDIA Corporation\NetService：该目录是遥测/日志文件，重启后由服务自动重建、
+            #     持续被进程写入，清理收益有限且冲突概率更高，暂不作为默认必清项收录。
+            $Sync.ScanItems["DriverCache"].Paths = @(
+                "$env:SystemDrive\NVIDIA",
+                "$env:SystemDrive\AMD",
+                "$env:SystemDrive\INTEL",
+                "$env:ProgramData\NVIDIA Corporation\Downloader",
+                "$env:ProgramFiles\NVIDIA Corporation\Installer2"
+            ) | Where-Object { Test-Path $_ }
+        }
         if ($Sync.ScanItems["AdobeCache"].Checked) {
             $adobePaths = New-Object System.Collections.Generic.List[string]
             foreach ($d in $userDirs) { [void]$adobePaths.Add("$d\AppData\Roaming\Adobe\Common\Media Cache Files"); [void]$adobePaths.Add("$d\AppData\Roaming\Adobe\Common\Media Cache") }
@@ -1258,30 +1345,12 @@ $ScanScriptBlock = {
             $Sync.ScanItems["ThumbCache"].Paths = $thumbPaths
         }
         if ($Sync.ScanItems["WinUpdate"].Checked) { $Sync.ScanItems["WinUpdate"].Paths = @("$env:SystemRoot\SoftwareDistribution\Download") }
-        # [修复] 原来把 "$env:SystemRoot\Logs" 归到 MemoryDumps(内存转储与崩溃缓存) 里一起清，
-        # 但 Windows\Logs 里还装着 CBS、DISM、WindowsUpdate 等诊断日志，跟"崩溃转储"不是一回事，
-        # 且 MemoryDumps 默认是勾选状态，容易在用户没意识到的情况下把有排障价值的日志一并删掉。拆成两个独立项。
+        # Windows\Logs 装的是 CBS/DISM/WindowsUpdate 等诊断日志，与"崩溃转储"(MemoryDumps，默认勾选)不是一回事，
+        # 混在一起容易在用户没意识到的情况下删掉有排障价值的日志，故拆成两个独立项。
         if ($Sync.ScanItems["MemoryDumps"].Checked) { $Sync.ScanItems["MemoryDumps"].Paths = @("$env:SystemRoot\MEMORY.DMP", "$env:SystemRoot\Minidump") | Where-Object { Test-Path $_ } }
         if ($Sync.ScanItems["WinDiagLogs"].Checked) { $Sync.ScanItems["WinDiagLogs"].Paths = @("$env:SystemRoot\Logs") | Where-Object { Test-Path $_ } }
         if ($Sync.ScanItems["EventLogs"].Checked) { $Sync.ScanItems["EventLogs"].Paths = @("$env:SystemRoot\System32\Winevt\Logs") | Where-Object { Test-Path $_ } }
-        if ($Sync.ScanItems["RecycleBin"].Checked) {
-            Write-AsyncLog "[扫描] 回收站 (使用 API 精准获取大小)..."
-            $rbPaths     = New-Object System.Collections.Generic.List[string]
-            $totalRbSize = 0
-            foreach ($drv in (Get-FixedDriveLetters)) {
-                $path = "$drv\`$Recycle.Bin"
-                if (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) {
-                    [void]$rbPaths.Add($path)
-                    # 传入根路径（如 "C:\"）查询该驱动器回收站大小
-                    $size = [FrostBladeWinAPI_v1]::GetRecycleBinTotalSize("$drv\")
-                    $totalRbSize += $size
-                    Write-AsyncLog "  -> 驱动器 $drv 回收站占用: $([math]::Round($size/1MB,2)) MB"
-                }
-            }
-            # 已在外层 Monitor 锁内，直接赋值，不再重入（避免死锁）
-            $Sync.ScanItems["RecycleBin"].Paths = $rbPaths | Select-Object -Unique
-            $Sync.ScanItems["RecycleBin"].Size  = $totalRbSize
-        }
+        # [调整] RecycleBin 的扫描逻辑挪到本锁外面单独处理（见下方 finally 之后），原因见下方新代码块注释。
         if ($Sync.ScanItems["WERFiles"].Checked) {
             $werPaths = New-Object System.Collections.Generic.List[string]
             [void]$werPaths.Add("$env:ProgramData\Microsoft\Windows\WER\ReportArchive")
@@ -1294,7 +1363,67 @@ $ScanScriptBlock = {
         }
     } finally { [System.Threading.Monitor]::Exit($Sync) }
 
-    # RecycleBin 已在上方用 SHQueryRecycleBin API 精确赋值，不进此循环（GetDirectorySizeFast 无法穿透 $Recycle.Bin 权限保护，会返回 0 覆盖掉正确值）
+    # --- 回收站扫描：RecycleBinMonths<=0 走快速路径（SHQueryRecycleBin 直接测总量）；
+    #     >0 时逐项枚举统计"删除时间早于 N 个月前"的大小。逐项枚举可能耗时较久，
+    #     故放在上面共享 Monitor 锁之外，避免拖慢其它扫描项、影响 GUI 用锁读取进度时的响应。 ---
+    if ($Sync.ScanItems["RecycleBin"].Checked) {
+        Write-AsyncLog "[扫描] 回收站..."
+        $rbPaths     = New-Object System.Collections.Generic.List[string]
+        $totalRbSize = 0
+        $rbMonths = 0
+        try { $rbMonths = [int]$Sync.RecycleBinMonths } catch { $rbMonths = 0 }
+
+        if ($rbMonths -le 0) {
+            # 原有全量路径：只用 API 测总量，速度最快，对应"全部清空"
+            foreach ($drv in (Get-FixedDriveLetters)) {
+                $path = "$drv\`$Recycle.Bin"
+                if (Test-Path -LiteralPath $path -ErrorAction SilentlyContinue) {
+                    [void]$rbPaths.Add($path)
+                    $size = [FrostBladeWinAPI_v1]::GetRecycleBinTotalSize("$drv\")
+                    $totalRbSize += $size
+                    Write-AsyncLog "  -> 驱动器 $drv 回收站占用: $([math]::Round($size/1MB,2)) MB"
+                }
+            }
+        } else {
+            # 选择性路径：借助 Shell.Application 逐项枚举，只统计删除时间早于 $cutoff 的项目
+            $cutoff = (Get-Date).AddMonths(-$rbMonths)
+            $shell = $null; $rbFolder = $null
+            try {
+                $shell = New-Object -ComObject Shell.Application
+                $rbFolder = $shell.Namespace(0xA)
+                if ($rbFolder) {
+                    foreach ($item in @($rbFolder.Items())) {
+                        try {
+                            if ($item.ModifyDate -and ([datetime]$item.ModifyDate) -lt $cutoff) {
+                                $itemSize = 0
+                                try { $itemSize = [long]$item.ExtendedProperty("Size") } catch { }
+                                if ($itemSize -le 0 -and (Test-Path -LiteralPath $item.Path -ErrorAction SilentlyContinue)) {
+                                    # 部分系统上文件夹项的 ExtendedProperty("Size") 取不到值，退化为文件系统递归测量兜底
+                                    try { $itemSize = [FrostBladeWinAPI_v1]::GetDirectorySizeFast($item.Path) } catch { }
+                                }
+                                $totalRbSize += $itemSize
+                                [void]$rbPaths.Add($item.Path)
+                            }
+                        } catch { }
+                    }
+                }
+                Write-AsyncLog "  -> 回收站中 $rbMonths 个月前的项目占用: $([math]::Round($totalRbSize/1MB,2)) MB（共 $($rbPaths.Count) 项）"
+            } catch {
+                Write-AsyncLog "  -> [警告] 回收站按时间筛选扫描失败：$($_.Exception.Message)，本次按 0 处理，不影响其他清理项。"
+            } finally {
+                if ($rbFolder) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($rbFolder) }
+                if ($shell) { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+            }
+        }
+
+        [System.Threading.Monitor]::Enter($Sync)
+        try {
+            $Sync.ScanItems["RecycleBin"].Paths = $rbPaths | Select-Object -Unique
+            $Sync.ScanItems["RecycleBin"].Size  = $totalRbSize
+        } finally { [System.Threading.Monitor]::Exit($Sync) }
+    }
+
+    # RecycleBin 已在上方单独处理并精确赋值，不进此循环（GetDirectorySizeFast 无法穿透 $Recycle.Bin 权限保护，直接跑会返回 0 覆盖掉正确值）
     $miscKeys = @("DriverCache", "AdobeCache", "D3DSCache", "UWPAppCache", "ThumbCache", "WinUpdate", "MemoryDumps", "WinDiagLogs", "EventLogs",
                   "DeliveryOpt", "WindowsOld", "FontCache", "PrintSpool", "SearchIndex", "AspTemp",
                   "WindowsUpgradeLogs", "Prefetch", "WERFiles")
@@ -1334,18 +1463,12 @@ $ScanScriptBlock = {
     $Sync.IsRunning = $false
 }
 
-# ==========================================
-
 # =====================================================================
-# 模块 06-CleanEngine : 异步后台清理引擎 (ScriptBlock，运行于独立 Runspace)
-# 职责：SafeClean（robocopy 镜像清空 + 残留核查）、Remove-ItemRobust（MoveFileEx 延迟删除兜底）、
-#       按 ScanItems.Paths 执行真正的删除/takeown 提权等破坏性操作。
-# 依赖：01-WinAPI（MoveFileEx）、03-ScanState（ScanItems/HighRiskKeys）。
-# 注意：这是全脚本风险最集中的模块，任何改动都应该优先复核，而不是顺手改。
+# 6. 异步后台清理引擎 (ScriptBlock，运行于独立 Runspace)
+#    SafeClean（robocopy 镜像清空 + 残留核查）、Remove-ItemRobust（MoveFileEx 计划重启删除兜底）、
+#    按 ScanItems.Paths 执行真正的删除/takeown 提权等破坏性操作。
+#    注意：这是全脚本风险最集中的模块，任何改动都应该优先复核，而不是顺手改。
 # =====================================================================
-
-# 5. 异步后台清理引擎 (ScriptBlock)
-# ==========================================
 $CleanScriptBlock = {
     param($Sync)
     
@@ -1451,7 +1574,34 @@ $CleanScriptBlock = {
         if ($item.Checked) {
             Write-AsyncLog "[清理] $($item.Name)..."
             if ($key -eq "RecycleBin") {
-                [FrostBladeWinAPI_v1]::SHEmptyRecycleBin([IntPtr]::Zero, $null, 7) | Out-Null
+                $rbMonths = 0
+                try { $rbMonths = [int]$Sync.RecycleBinMonths } catch { $rbMonths = 0 }
+                if ($rbMonths -le 0) {
+                    # 默认行为不变：整体清空，最快
+                    [FrostBladeWinAPI_v1]::SHEmptyRecycleBin([IntPtr]::Zero, $null, 7) | Out-Null
+                } else {
+                    # 选择性清理：逐个删除扫描阶段圈定的项目，其余原样保留。双层兜底：优先 Remove-Item，
+                    # 失败则退回 SHFileOperationDeleteSilent（带 FOF_SILENT|FOF_NOCONFIRMATION|FOF_NOERRORUI，
+                    # 确保不弹出交互框卡住 -Silent 或后台清理线程）。
+                    $rbFailCount = 0
+                    foreach ($rp in $item.Paths) {
+                        $removed = $false
+                        try {
+                            if (-not (Test-Path -LiteralPath $rp -ErrorAction SilentlyContinue)) {
+                                $removed = $true
+                            } else {
+                                Remove-Item -LiteralPath $rp -Force -Recurse -ErrorAction Stop
+                                $removed = $true
+                            }
+                        } catch {
+                            try {
+                                if ([FrostBladeWinAPI_v1]::SHFileOperationDeleteSilent($rp) -eq 0) { $removed = $true }
+                            } catch { }
+                        }
+                        if (-not $removed) { $rbFailCount++ }
+                    }
+                    if ($rbFailCount -gt 0) { Write-AsyncLog "  -> [警告] 回收站选择性清理中有 $rbFailCount 项删除失败（可能仍被其他进程占用）。" }
+                }
             } elseif ($key -eq "RegUninstall") {
                 foreach ($p in $item.Paths) { 
                     try { Remove-Item -Path $p -Force -Recurse -Confirm:$false -ErrorAction Stop } 
@@ -1625,9 +1775,8 @@ $CleanScriptBlock = {
     $Sync.IsRunning = $false
 }
 
-# [新增] Compact OS 还原脚本块：与 $CleanScriptBlock 相互独立，仅用于"取消系统压缩"这一单独操作，
-# 复用与 Scan/Clean 相同的 Start-RunspaceJob + UITimer 机制（写 $Sync.LogQueue / $Sync.Progress，结束时置 IsRunning=$false），
-# 不走 ScanItems 那一整套多项目遍历逻辑，因为它只做一件事。
+# Compact OS 还原脚本块：与 $CleanScriptBlock 相互独立，仅用于"取消系统压缩"这一单一操作，
+# 复用相同的 Start-RunspaceJob + UITimer 机制，但不走 ScanItems 多项目遍历逻辑。
 $CompactRevertScriptBlock = {
     param($Sync)
     function Write-AsyncLog([string]$msg) {
@@ -1650,11 +1799,9 @@ $CompactRevertScriptBlock = {
 }
 
 # =====================================================================
-# 模块 06.5-PreCleanActions : 清理前置动作（还原点 / 关闭占用进程）
-# 职责：原本硬编码在 $CleanButton.Add_Click 里的"创建系统还原点"与"关闭占用进程"逻辑，
-#       在此提取为独立全局函数，不含任何 UI 交互（弹窗/确认），使 GUI 与 -Silent 静默模式
-#       可以共用同一套底层实现——GUI 侧负责弹窗确认，静默侧负责按参数决定是否调用。
-# 依赖：$Global:ProcessCloseMap、$Global:SyncHash.ScanItems。
+# 7. 清理前置动作 (还原点 / 关闭占用进程)
+#    从 GUI 按钮回调中提取为独立全局函数，不含任何 UI 交互，供 GUI 与 -Silent 共用同一套实现
+#    ——GUI 侧负责弹窗确认，静默侧负责按参数决定是否调用。
 # =====================================================================
 
 function Get-PreCleanTargetProcessNames {
@@ -1705,37 +1852,42 @@ function Invoke-PreCleanRestorePoint {
     }
 }
 
-# ==========================================
-
 # =====================================================================
-# 模块 07-Gui : 主界面与大文件扫描器窗口
-# 职责：WinForms 控件搭建、事件绑定、定时器轮询 SyncHash/LFSync 更新界面、
-#       调起 05-ScanEngine / 06-CleanEngine / 04-LargeFileEngine 对应的 Runspace。
-# 依赖：以上全部模块（GUI 是最外层的编排者，不应包含扫描/清理算法本身）。
+# 8. GUI 初始化与静默执行调度
+#    WinForms 控件搭建、事件绑定、定时器轮询 SyncHash/LFSync 更新界面，调起第 4/5/6 节的 Runspace 任务。
 # =====================================================================
-
-# 6. GUI 初始化 / 静默执行调度
-# ==========================================
 if ($Silent) {
     # =====================================================================
-    # [新增] 静默模式 (-Silent) 执行流
-    # 修复：原脚本 GUI 分支之外没有任何调度代码，-Silent 在权限检查通过后直接跳过整个
-    # "if (-not $Silent) { ... }" 大块（原来包住了从扫描调度到清理调度的一切），什么都不做就结束。
-    # 这里补上一条独立的、无 UI 依赖的同步执行链路：扫描 -> (可选)前置动作 -> 清理。
+    # 静默模式 (-Silent) 执行流：扫描 -> 哨兵校验 -> (可选)前置动作 -> 清理，无 UI 依赖。
     #
     # 用法示例：
     #   powershell -File FrostBlade.ps1 -Silent
     #   powershell -File FrostBlade.ps1 -Silent -CreateRestorePoint -ClosePrograms
+    #   powershell -File FrostBlade.ps1 -Silent -RecycleBinMonths 6 -LogFile C:\Logs\frostblade.log
     #
-    # 清理哪些项：直接沿用 $Global:ScanItems 里每一项的默认 Checked 状态（见"模块03-ScanState"），
-    # 与全新打开 GUI 时勾选框的初始状态完全一致——第一梯队(安全必清)默认开，第二/三梯队(可选/高危)默认关。
-    # 如需静默清理里也覆盖高危项，需自行在此文件顶部调整 $Global:ScanItems 对应项的 Checked 值，
-    # 不建议通过命令行参数临时打开高危项，以免误操作被脚本化、无人复核地重复执行。
+    # 清理哪些项：沿用 $Global:ScanItems 各项的默认 Checked 状态（第 3 节），与 GUI 初始勾选一致
+    # ——第一梯队(安全必清)默认开，第二/三梯队(可选/高危)默认关。如需静默清理覆盖高危项，
+    # 需自行在文件顶部调整对应项的 Checked 值，不建议通过命令行参数临时打开，以免无人复核地重复执行。
+    #
+    # 退出码约定，供计划任务/自动化调用方判断执行结果：
+    #   0 = 正常完成，且确实清理出了 > 0 的空间
+    #   3 = 正常跑完，但未发现任何可清理内容（可能系统已很干净，也可能扫描异常，不算失败，
+    #       但用不同于 0 的退出码告知调用方"这次没有实际效果"）
+    #   1 = 运行时发生未处理异常（由文件顶部的 trap 兜底捕获并退出，不在这里设置）
     # =====================================================================
 
     function Write-SilentLog([string]$msg) {
         $timestamp = Get-Date -Format "HH:mm:ss"
-        Write-Host "[$timestamp] $msg"
+        $line = "[$timestamp] $msg"
+        Write-Host $line
+        if ($LogFile) {
+            # -LogFile 落盘失败（路径不可写、磁盘满等）不应中断清理流程，仅提示一次后续仅输出到控制台。
+            try { Add-Content -LiteralPath $LogFile -Value $line -Encoding UTF8 -ErrorAction Stop }
+            catch {
+                Write-Host "[$timestamp] [警告] 写入日志文件失败: $($_.Exception.Message)（后续仅输出到控制台）"
+                $Script:LogFile = $null
+            }
+        }
     }
 
     function Invoke-SilentEngineJob([scriptblock]$ScriptBlock, [string]$JobName) {
@@ -1776,10 +1928,20 @@ if ($Silent) {
 
     Write-SilentLog "[FrostBlade] 进入静默运行模式..."
     Write-SilentLog ("[FrostBlade] 前置动作：创建还原点={0}，关闭占用进程={1}（均需显式传参开启，默认与GUI未勾选状态一致）" -f $CreateRestorePoint.IsPresent, $ClosePrograms.IsPresent)
+    $Global:SyncHash.RecycleBinMonths = $RecycleBinMonths
+    if ($RecycleBinMonths -gt 0) { Write-SilentLog "[FrostBlade] 回收站清理范围：仅清理 $RecycleBinMonths 个月前删除的项目（默认是全部清空，此项由 -RecycleBinMonths 显式指定）。" }
 
     # 1. 扫描
     Write-SilentLog "[FrostBlade] 步骤 1/3：正在扫描..."
     Invoke-SilentEngineJob $ScanScriptBlock "扫描引擎"
+
+    # 哨兵校验：记下扫描是否发现了可清理内容，避免"扫描其实什么都没扫到 -> 清理空跑一遍 -> 假成功"
+    # 这种情况被调用方误判为正常；不阻止继续执行清理，只是最后用不同退出码告知调用方。
+    [long]$preCleanTotal = 0
+    foreach ($k in $Global:SyncHash.ScanItems.Keys) { if ($Global:SyncHash.ScanItems[$k].Checked) { $preCleanTotal += $Global:SyncHash.ScanItems[$k].Size } }
+    if ($preCleanTotal -le 0) {
+        Write-SilentLog "[FrostBlade] [提示] 本次扫描未发现任何可清理内容——可能是系统本来就很干净，也可能是扫描过程出现了异常（例如权限不足），脚本无法自动区分这两种情况，请留意上面的扫描日志确认。"
+    }
 
     # 2. 前置动作（还原点 + 关闭占用进程），均为可选，默认不执行
     $Global:SyncHash.SkipVSSThisRun = $false
@@ -1814,9 +1976,31 @@ if ($Silent) {
     [long]$totalFreed = 0
     foreach ($k in $Global:ScanItems.Keys) { if ($Global:ScanItems[$k].Checked) { $totalFreed += $Global:ScanItems[$k].Size } }
     Write-SilentLog ("[FrostBlade] 静默清理执行完毕，预计释放约 {0:N2} GB。部分变更（休眠/Compact OS/组件存储等）需重启后完全生效。" -f ($totalFreed/1GB))
+
+    if ($totalFreed -le 0) {
+        Write-SilentLog "[FrostBlade] 退出码 3：本次运行没有产生实际清理效果（详见上方提示）。"
+        exit 3
+    }
+    exit 0
 } else {
+    # --- UI 美化：统一的扁平按钮样式（去掉 Windows 默认的立体浮雕边框，加悬停反馈） ---
+    function Get-FrostBladeShade([System.Drawing.Color]$Color, [double]$Factor) {
+        [System.Drawing.Color]::FromArgb($Color.A, [int]($Color.R * $Factor), [int]($Color.G * $Factor), [int]($Color.B * $Factor))
+    }
+    function Set-FrostBladeButtonStyle {
+        param([System.Windows.Forms.Button]$Btn, [System.Drawing.Color]$BackColor, [System.Drawing.Color]$ForeColor = [System.Drawing.Color]::White)
+        $Btn.FlatStyle = "Flat"
+        $Btn.Cursor = "Hand"
+        $Btn.BackColor = $BackColor
+        $Btn.ForeColor = $ForeColor
+        $Btn.FlatAppearance.BorderSize = 1
+        $Btn.FlatAppearance.BorderColor = Get-FrostBladeShade $BackColor 0.85
+        $Btn.FlatAppearance.MouseOverBackColor = Get-FrostBladeShade $BackColor 0.92
+        $Btn.FlatAppearance.MouseDownBackColor = Get-FrostBladeShade $BackColor 0.8
+    }
+
     $MainForm = New-Object System.Windows.Forms.Form
-    $MainForm.Text = "霜刃 FrostBlade v1.0 Beta"
+    $MainForm.Text = "霜刃 FrostBlade v1.0"
     $MainForm.Size = New-Object System.Drawing.Size(900, 720)
     $MainForm.StartPosition = "CenterScreen"
     $MainForm.FormBorderStyle = "FixedSingle"
@@ -1824,30 +2008,48 @@ if ($Silent) {
     $MainForm.BackColor = [System.Drawing.Color]::FromArgb(245, 246, 248)
 
     $HeaderPanel = New-Object System.Windows.Forms.Panel; $HeaderPanel.Size = New-Object System.Drawing.Size(900, 70); $HeaderPanel.BackColor = [System.Drawing.Color]::FromArgb(43, 87, 154); $MainForm.Controls.Add($HeaderPanel)
-    $TitleLabel = New-Object System.Windows.Forms.Label; $TitleLabel.Font = New-Object System.Drawing.Font("微软雅黑", 14, [System.Drawing.FontStyle]::Bold); $TitleLabel.Text = "霜刃 · 垃圾清理工具 v1.0 Beta"; $TitleLabel.ForeColor = [System.Drawing.Color]::White; $TitleLabel.Location = New-Object System.Drawing.Point(20, 20); $TitleLabel.Size = New-Object System.Drawing.Size(550, 30); $HeaderPanel.Controls.Add($TitleLabel)
-    $BigFileButton = New-Object System.Windows.Forms.Button; $BigFileButton.Text = "大文件扫描"; $BigFileButton.Font = New-Object System.Drawing.Font("微软雅黑", 9, [System.Drawing.FontStyle]::Bold); $BigFileButton.BackColor = [System.Drawing.Color]::FromArgb(235, 235, 235); $BigFileButton.Location = New-Object System.Drawing.Point(710, 18); $BigFileButton.Size = New-Object System.Drawing.Size(160, 34); $HeaderPanel.Controls.Add($BigFileButton)
+    $HeaderAccent = New-Object System.Windows.Forms.Panel; $HeaderAccent.Location = New-Object System.Drawing.Point(0, 67); $HeaderAccent.Size = New-Object System.Drawing.Size(900, 3); $HeaderAccent.BackColor = [System.Drawing.Color]::FromArgb(90, 158, 232); $HeaderPanel.Controls.Add($HeaderAccent)
+    $TitleLabel = New-Object System.Windows.Forms.Label; $TitleLabel.Font = New-Object System.Drawing.Font("微软雅黑", 14, [System.Drawing.FontStyle]::Bold); $TitleLabel.Text = "霜刃 · 纯绿化单文件版 v1.0"; $TitleLabel.ForeColor = [System.Drawing.Color]::White; $TitleLabel.Location = New-Object System.Drawing.Point(20, 20); $TitleLabel.Size = New-Object System.Drawing.Size(550, 30); $HeaderPanel.Controls.Add($TitleLabel)
+    $BigFileButton = New-Object System.Windows.Forms.Button; $BigFileButton.Text = "大文件扫描"; $BigFileButton.Font = New-Object System.Drawing.Font("微软雅黑", 9, [System.Drawing.FontStyle]::Bold); $BigFileButton.Location = New-Object System.Drawing.Point(710, 18); $BigFileButton.Size = New-Object System.Drawing.Size(160, 34); $HeaderPanel.Controls.Add($BigFileButton)
+    Set-FrostBladeButtonStyle -Btn $BigFileButton -BackColor ([System.Drawing.Color]::FromArgb(74, 118, 179)) -ForeColor ([System.Drawing.Color]::White)
+
 
     $LeftPanel = New-Object System.Windows.Forms.Panel; $LeftPanel.Location = New-Object System.Drawing.Point(15, 85); $LeftPanel.Size = New-Object System.Drawing.Size(420, 520); $LeftPanel.BorderStyle = "FixedSingle"; $LeftPanel.BackColor = [System.Drawing.Color]::White; $MainForm.Controls.Add($LeftPanel)
 
-    # [新增/UI调整] 顶部"全选/取消"按钮 + "自动关闭占用进程"/"自动创建还原点"这两个复选框，
-    # 原来直接贴在 $LeftPanel 上，和下面清理项列表用的是同一块背景，视觉上容易被当成列表的一部分。
-    # 这里单独拆出一个 $ToolbarPanel 承载这4个控件，给它一个和列表区（$InnerPanel，纯白）不同的浅色底，
-    # 再加一条 1px 分隔线，让"操作/选项区"和"清理项列表区"在视觉上一眼分开，不需要改动下面任何业务逻辑
-    # ——这4个控件仍然是同样的变量名、同样的事件绑定，只是换了个父容器。
-    $ToolbarPanel = New-Object System.Windows.Forms.Panel; $ToolbarPanel.Location = New-Object System.Drawing.Point(0, 0); $ToolbarPanel.Size = New-Object System.Drawing.Size(418, 75); $ToolbarPanel.BackColor = [System.Drawing.Color]::FromArgb(222, 232, 244); $LeftPanel.Controls.Add($ToolbarPanel)
-    $ToolbarDivider = New-Object System.Windows.Forms.Panel; $ToolbarDivider.Location = New-Object System.Drawing.Point(0, 75); $ToolbarDivider.Size = New-Object System.Drawing.Size(418, 1); $ToolbarDivider.BackColor = [System.Drawing.Color]::FromArgb(190, 202, 218); $LeftPanel.Controls.Add($ToolbarDivider)
+    # $ToolbarPanel 承载"全选/取消"按钮与两个前置动作复选框，用不同底色 + 1px 分隔线
+    # 与下方清理项列表区（$InnerPanel）区分开，纯视觉分区，不影响下方任何业务逻辑。
+    $ToolbarPanel = New-Object System.Windows.Forms.Panel; $ToolbarPanel.Location = New-Object System.Drawing.Point(0, 0); $ToolbarPanel.Size = New-Object System.Drawing.Size(418, 96); $ToolbarPanel.BackColor = [System.Drawing.Color]::FromArgb(222, 232, 244); $LeftPanel.Controls.Add($ToolbarPanel)
+    $ToolbarDivider = New-Object System.Windows.Forms.Panel; $ToolbarDivider.Location = New-Object System.Drawing.Point(0, 96); $ToolbarDivider.Size = New-Object System.Drawing.Size(418, 1); $ToolbarDivider.BackColor = [System.Drawing.Color]::FromArgb(190, 202, 218); $LeftPanel.Controls.Add($ToolbarDivider)
 
-    $BtnAll = New-Object System.Windows.Forms.Button; $BtnAll.Text = "全选"; $BtnAll.BackColor = [System.Drawing.Color]::White; $BtnAll.Size = New-Object System.Drawing.Size(60,25); $BtnAll.Location = New-Object System.Drawing.Point(5,5); $ToolbarPanel.Controls.Add($BtnAll)
-    $BtnNone = New-Object System.Windows.Forms.Button; $BtnNone.Text = "取消"; $BtnNone.BackColor = [System.Drawing.Color]::White; $BtnNone.Size = New-Object System.Drawing.Size(60,25); $BtnNone.Location = New-Object System.Drawing.Point(70,5); $ToolbarPanel.Controls.Add($BtnNone)
+    $BtnAll = New-Object System.Windows.Forms.Button; $BtnAll.Text = "全选"; $BtnAll.Size = New-Object System.Drawing.Size(60,25); $BtnAll.Location = New-Object System.Drawing.Point(5,5); $ToolbarPanel.Controls.Add($BtnAll)
+    Set-FrostBladeButtonStyle -Btn $BtnAll -BackColor ([System.Drawing.Color]::White) -ForeColor ([System.Drawing.Color]::FromArgb(43, 87, 154))
+    $BtnNone = New-Object System.Windows.Forms.Button; $BtnNone.Text = "取消"; $BtnNone.Size = New-Object System.Drawing.Size(60,25); $BtnNone.Location = New-Object System.Drawing.Point(70,5); $ToolbarPanel.Controls.Add($BtnNone)
+    Set-FrostBladeButtonStyle -Btn $BtnNone -BackColor ([System.Drawing.Color]::White) -ForeColor ([System.Drawing.Color]::FromArgb(43, 87, 154))
     $AutoCloseChk = New-Object System.Windows.Forms.CheckBox; $AutoCloseChk.Text = "清理前自动关闭占用进程(微信/QQ/浏览器等)"; $AutoCloseChk.Font = New-Object System.Drawing.Font("微软雅黑", 8); $AutoCloseChk.ForeColor = [System.Drawing.Color]::DarkSlateGray; $AutoCloseChk.BackColor = [System.Drawing.Color]::Transparent; $AutoCloseChk.Checked = $false; $AutoCloseChk.Location = New-Object System.Drawing.Point(5, 33); $AutoCloseChk.Size = New-Object System.Drawing.Size(405, 18); $ToolbarPanel.Controls.Add($AutoCloseChk)
     $RestorePointChk = New-Object System.Windows.Forms.CheckBox; $RestorePointChk.Text = "清理前自动创建系统还原点(仅保护系统设置/系统文件级操作)"; $RestorePointChk.Font = New-Object System.Drawing.Font("微软雅黑", 8); $RestorePointChk.ForeColor = [System.Drawing.Color]::DarkSlateGray; $RestorePointChk.BackColor = [System.Drawing.Color]::Transparent; $RestorePointChk.Checked = $false; $RestorePointChk.Location = New-Object System.Drawing.Point(5, 53); $RestorePointChk.Size = New-Object System.Drawing.Size(405, 18); $ToolbarPanel.Controls.Add($RestorePointChk)
-    # [新增] Windows 系统还原自 Win8 起不再备份个人文件，只能保护系统文件/注册表/驱动等系统级变更。
-    # 对"微信媒体""浏览器缓存""残留目录"等用户数据类清理项完全无法起到恢复作用，用 Tooltip 明确告知，避免用户误以为勾了它就万无一失。
+    # 系统还原点自 Win8 起不再备份个人文件，只能保护系统文件/注册表/驱动等系统级变更，
+    # 对微信媒体/浏览器缓存/残留目录等用户数据类清理项无法起到恢复作用，用 Tooltip 明确告知。
     $RPTip = New-Object System.Windows.Forms.ToolTip
     $RPTip.AutoPopDelay = 15000; $RPTip.InitialDelay = 300; $RPTip.ReshowDelay = 100
     $RPTip.SetToolTip($RestorePointChk, "系统还原点只能回滚系统设置/系统文件/注册表相关的变更（如 WinSxS 压缩、Compact OS、休眠开关等），`r`n不会恢复被清理掉的个人文件——微信媒体、浏览器缓存、残留目录等一旦删除，还原点无法找回，请务必单独确认。")
 
-    $InnerPanel = New-Object System.Windows.Forms.Panel; $InnerPanel.Location = New-Object System.Drawing.Point(0, 76); $InnerPanel.Size = New-Object System.Drawing.Size(420, 444); $InnerPanel.AutoScroll = $true; $InnerPanel.BackColor = [System.Drawing.Color]::White; $LeftPanel.Controls.Add($InnerPanel)
+    # 回收站清理范围：默认"全部清空"；选其余选项后，清理项列表中"回收站"仅清理早于所选月数的内容。
+    $RBScopeLabel = New-Object System.Windows.Forms.Label; $RBScopeLabel.Text = "回收站清理范围:"; $RBScopeLabel.Font = New-Object System.Drawing.Font("微软雅黑", 8); $RBScopeLabel.ForeColor = [System.Drawing.Color]::DarkSlateGray; $RBScopeLabel.BackColor = [System.Drawing.Color]::Transparent; $RBScopeLabel.Location = New-Object System.Drawing.Point(5, 75); $RBScopeLabel.Size = New-Object System.Drawing.Size(95, 18); $ToolbarPanel.Controls.Add($RBScopeLabel)
+    $RBScopeCombo = New-Object System.Windows.Forms.ComboBox; $RBScopeCombo.DropDownStyle = "DropDownList"; $RBScopeCombo.Font = New-Object System.Drawing.Font("微软雅黑", 8); $RBScopeCombo.Location = New-Object System.Drawing.Point(100, 72); $RBScopeCombo.Size = New-Object System.Drawing.Size(160, 20); $ToolbarPanel.Controls.Add($RBScopeCombo)
+    $RBScopeMonthsMap = @(0, 3, 6, 12)
+    foreach ($t in @("全部清空(默认)", "仅清 3 个月前", "仅清 6 个月前", "仅清 12 个月前")) { [void]$RBScopeCombo.Items.Add($t) }
+    $RBScopeCombo.SelectedIndex = 0
+    $RBScopeCombo.Add_SelectedIndexChanged({
+        $Global:SyncHash.RecycleBinMonths = $RBScopeMonthsMap[$RBScopeCombo.SelectedIndex]
+        # 范围一变，之前扫描出来的"回收站"大小/项目清单就不再准确，标记 Stale 强制要求重新扫描后才能清理，
+        # 跟勾选框改变时的处理方式保持一致。
+        if ($Global:SyncHash.ScanItems["RecycleBin"]) { $Global:SyncHash.ScanItems["RecycleBin"].Stale = $true }
+    })
+    $RBScopeTip = New-Object System.Windows.Forms.ToolTip
+    $RBScopeTip.AutoPopDelay = 15000; $RBScopeTip.InitialDelay = 300; $RBScopeTip.ReshowDelay = 100
+    $RBScopeTip.SetToolTip($RBScopeCombo, "选择「全部清空」以外的选项时，只会删除回收站里删除时间早于所选月数的项目，其余保留；改动后需要重新扫描一次才能得到准确大小。")
+
+    $InnerPanel = New-Object System.Windows.Forms.Panel; $InnerPanel.Location = New-Object System.Drawing.Point(0, 97); $InnerPanel.Size = New-Object System.Drawing.Size(420, 423); $InnerPanel.AutoScroll = $true; $InnerPanel.BackColor = [System.Drawing.Color]::White; $LeftPanel.Controls.Add($InnerPanel)
 
     $ControlsMap = @{}
     $YOffset = 0
@@ -1871,16 +2073,15 @@ if ($Silent) {
         $YOffset += 25
 
         if ($Key -eq "CompactOS") {
-            # [新增] Compact OS 是可逆操作（对应 compact.exe /CompactOS:never），但原脚本只提供"压缩"入口、
-            # 没有"取消压缩"入口，用户想撤销只能自己敲命令行。这里在该行下面加一个独立按钮，
-            # 直接跑 $CompactRevertScriptBlock，和勾选框/深度清理流程完全独立，不需要先勾选、也不需要点"深度清理"。
+            # Compact OS 是可逆操作（compact.exe /CompactOS:never），独立加一个还原按钮直接跑
+            # $CompactRevertScriptBlock，与勾选框/深度清理流程无关，不需要先勾选也不需要点"深度清理"。
             $RevertCompactBtn = New-Object System.Windows.Forms.Button
             $RevertCompactBtn.Text = "↩ 还原压缩(取消 Compact OS)"
             $RevertCompactBtn.Font = New-Object System.Drawing.Font("微软雅黑", 8)
-            $RevertCompactBtn.BackColor = [System.Drawing.Color]::FromArgb(230, 230, 250)
             $RevertCompactBtn.Location = New-Object System.Drawing.Point(20, $YOffset)
             $RevertCompactBtn.Size = New-Object System.Drawing.Size(200, 22)
             $InnerPanel.Controls.Add($RevertCompactBtn)
+            Set-FrostBladeButtonStyle -Btn $RevertCompactBtn -BackColor ([System.Drawing.Color]::FromArgb(120, 130, 200)) -ForeColor ([System.Drawing.Color]::White)
             $RevertCompactTip = New-Object System.Windows.Forms.ToolTip
             $RevertCompactTip.SetToolTip($RevertCompactBtn, "独立执行 compact.exe /CompactOS:never，把系统还原为压缩前的状态。`r`n可逆操作，不删除任何文件，可能需要几分钟，完成后建议重启电脑使更改完全生效。")
             $YOffset += 26
@@ -1890,15 +2091,18 @@ if ($Silent) {
     $BtnAll.Add_Click({ foreach ($k in $KeyList) { if ($Global:HighRiskKeys -contains $k) { continue }; $ControlsMap[$k].CheckBox.Checked = $true } })
     $BtnNone.Add_Click({ foreach ($k in $KeyList) { $ControlsMap[$k].CheckBox.Checked = $false } })
 
-    $LogBox = New-Object System.Windows.Forms.TextBox; $LogBox.Multiline = $true; $LogBox.ScrollBars = "Vertical"; $LogBox.ReadOnly = $true; $LogBox.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30); $LogBox.ForeColor = [System.Drawing.Color]::LimeGreen; $LogBox.Font = New-Object System.Drawing.Font("Consolas", 9.5); $LogBox.Location = New-Object System.Drawing.Point(445, 85); $LogBox.Size = New-Object System.Drawing.Size(425, 520); $LogBox.Text = "==================================================`r`n欢迎使用 霜刃 FrostBlade v1.0 Beta`r`n> 纯内存解析 (Zero I/O)`r`n> Runspace 内存防护池启动`r`n> CIM/WMI 双轨接口就绪`r`n==================================================`r`n[提示] 当前为测试版，不建议在有重要数据的电脑上使用。"; $MainForm.Controls.Add($LogBox)
+    $LogBox = New-Object System.Windows.Forms.TextBox; $LogBox.Multiline = $true; $LogBox.ScrollBars = "Vertical"; $LogBox.ReadOnly = $true; $LogBox.BorderStyle = "FixedSingle"; $LogBox.BackColor = [System.Drawing.Color]::FromArgb(30, 30, 30); $LogBox.ForeColor = [System.Drawing.Color]::LimeGreen; $LogBox.Font = New-Object System.Drawing.Font("Consolas", 9.5); $LogBox.Location = New-Object System.Drawing.Point(445, 85); $LogBox.Size = New-Object System.Drawing.Size(425, 520); $LogBox.Text = "==================================================`r`n欢迎使用 霜刃 FrostBlade v1.0`r`n> 纯内存解析 (Zero I/O)`r`n> Runspace 内存防护池启动`r`n> CIM/WMI 双轨接口就绪`r`n==================================================`r`n[提示] 清理项含启发式判断与不可逆操作，建议清理前逐项核对红色高危项。"; $MainForm.Controls.Add($LogBox)
     
-    $TotalLabel = New-Object System.Windows.Forms.Label; $TotalLabel.Text = "预计可释放: 0.00 GB"; $TotalLabel.Font = New-Object System.Drawing.Font("微软雅黑", 11, [System.Drawing.FontStyle]::Bold); $TotalLabel.Location = New-Object System.Drawing.Point(15, 612); $TotalLabel.Size = New-Object System.Drawing.Size(400, 25); $MainForm.Controls.Add($TotalLabel)
+    $TotalLabel = New-Object System.Windows.Forms.Label; $TotalLabel.Text = "预计可释放: 0.00 GB"; $TotalLabel.Font = New-Object System.Drawing.Font("微软雅黑", 11, [System.Drawing.FontStyle]::Bold); $TotalLabel.ForeColor = [System.Drawing.Color]::FromArgb(43, 87, 154); $TotalLabel.Location = New-Object System.Drawing.Point(15, 612); $TotalLabel.Size = New-Object System.Drawing.Size(400, 25); $MainForm.Controls.Add($TotalLabel)
     $ProgressBar = New-Object System.Windows.Forms.ProgressBar; $ProgressBar.Location = New-Object System.Drawing.Point(15, 640); $ProgressBar.Size = New-Object System.Drawing.Size(420, 14); $MainForm.Controls.Add($ProgressBar)
     $StatusLabel = New-Object System.Windows.Forms.Label; $StatusLabel.Text = "就绪"; $StatusLabel.Font = New-Object System.Drawing.Font("微软雅黑", 8); $StatusLabel.ForeColor = [System.Drawing.Color]::Gray; $StatusLabel.Location = New-Object System.Drawing.Point(15, 657); $StatusLabel.Size = New-Object System.Drawing.Size(420, 16); $MainForm.Controls.Add($StatusLabel)
 
-    $ScanButton = New-Object System.Windows.Forms.Button; $ScanButton.Text = "深度扫描分析"; $ScanButton.Font = New-Object System.Drawing.Font("微软雅黑", 10, [System.Drawing.FontStyle]::Bold); $ScanButton.BackColor = [System.Drawing.Color]::LightBlue; $ScanButton.Location = New-Object System.Drawing.Point(445, 615); $ScanButton.Size = New-Object System.Drawing.Size(140, 55); $MainForm.Controls.Add($ScanButton)
-    $CleanButton = New-Object System.Windows.Forms.Button; $CleanButton.Text = "执行深度清理"; $CleanButton.Font = New-Object System.Drawing.Font("微软雅黑", 10, [System.Drawing.FontStyle]::Bold); $CleanButton.BackColor = [System.Drawing.Color]::Tomato; $CleanButton.ForeColor = [System.Drawing.Color]::White; $CleanButton.Location = New-Object System.Drawing.Point(595, 615); $CleanButton.Size = New-Object System.Drawing.Size(140, 55); $CleanButton.Enabled = $false; $MainForm.Controls.Add($CleanButton)
-    $ExportButton = New-Object System.Windows.Forms.Button; $ExportButton.Text = "导出日志"; $ExportButton.Font = New-Object System.Drawing.Font("微软雅黑", 9, [System.Drawing.FontStyle]::Bold); $ExportButton.BackColor = [System.Drawing.Color]::LightGray; $ExportButton.Location = New-Object System.Drawing.Point(745, 615); $ExportButton.Size = New-Object System.Drawing.Size(125, 55); $MainForm.Controls.Add($ExportButton)
+    $ScanButton = New-Object System.Windows.Forms.Button; $ScanButton.Text = "深度扫描分析"; $ScanButton.Font = New-Object System.Drawing.Font("微软雅黑", 10, [System.Drawing.FontStyle]::Bold); $ScanButton.Location = New-Object System.Drawing.Point(445, 615); $ScanButton.Size = New-Object System.Drawing.Size(140, 55); $MainForm.Controls.Add($ScanButton)
+    Set-FrostBladeButtonStyle -Btn $ScanButton -BackColor ([System.Drawing.Color]::FromArgb(59, 130, 246)) -ForeColor ([System.Drawing.Color]::White)
+    $CleanButton = New-Object System.Windows.Forms.Button; $CleanButton.Text = "执行深度清理"; $CleanButton.Font = New-Object System.Drawing.Font("微软雅黑", 10, [System.Drawing.FontStyle]::Bold); $CleanButton.Location = New-Object System.Drawing.Point(595, 615); $CleanButton.Size = New-Object System.Drawing.Size(140, 55); $CleanButton.Enabled = $false; $MainForm.Controls.Add($CleanButton)
+    Set-FrostBladeButtonStyle -Btn $CleanButton -BackColor ([System.Drawing.Color]::FromArgb(220, 53, 69)) -ForeColor ([System.Drawing.Color]::White)
+    $ExportButton = New-Object System.Windows.Forms.Button; $ExportButton.Text = "导出日志"; $ExportButton.Font = New-Object System.Drawing.Font("微软雅黑", 9, [System.Drawing.FontStyle]::Bold); $ExportButton.Location = New-Object System.Drawing.Point(745, 615); $ExportButton.Size = New-Object System.Drawing.Size(125, 55); $MainForm.Controls.Add($ExportButton)
+    Set-FrostBladeButtonStyle -Btn $ExportButton -BackColor ([System.Drawing.Color]::FromArgb(233, 236, 239)) -ForeColor ([System.Drawing.Color]::FromArgb(73, 80, 87))
 
     function Refresh-GUI-Labels {
         [System.Threading.Monitor]::Enter($Global:SyncHash)
@@ -2041,14 +2245,16 @@ if ($Silent) {
         $RPSelNone.Add_Click({ foreach ($it in $RPList.Items) { $it.Checked = $false } })
 
         $RPConfirm = New-Object System.Windows.Forms.Button
-        $RPConfirm.Text = "确认删除勾选项"; $RPConfirm.BackColor = [System.Drawing.Color]::Tomato; $RPConfirm.ForeColor = [System.Drawing.Color]::White
+        $RPConfirm.Text = "确认删除勾选项"
         $RPConfirm.Location = New-Object System.Drawing.Point(560, 10); $RPConfirm.Size = New-Object System.Drawing.Size(120, 30)
         $RPConfirm.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $BtnPanel.Controls.Add($RPConfirm)
+        Set-FrostBladeButtonStyle -Btn $RPConfirm -BackColor ([System.Drawing.Color]::FromArgb(220, 53, 69)) -ForeColor ([System.Drawing.Color]::White)
         $RPCancel = New-Object System.Windows.Forms.Button
         $RPCancel.Text = "跳过残留目录清理"; $RPCancel.Location = New-Object System.Drawing.Point(690, 10); $RPCancel.Size = New-Object System.Drawing.Size(110, 30)
         $RPCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
         $BtnPanel.Controls.Add($RPCancel)
+        Set-FrostBladeButtonStyle -Btn $RPCancel -BackColor ([System.Drawing.Color]::FromArgb(233, 236, 239)) -ForeColor ([System.Drawing.Color]::FromArgb(73, 80, 87))
         $RPForm.AcceptButton = $RPConfirm
         $RPForm.CancelButton = $RPCancel
 
@@ -2108,14 +2314,16 @@ if ($Silent) {
         $RUSelNone.Add_Click({ foreach ($it in $RUList.Items) { $it.Checked = $false } })
 
         $RUConfirm = New-Object System.Windows.Forms.Button
-        $RUConfirm.Text = "确认删除勾选项"; $RUConfirm.BackColor = [System.Drawing.Color]::Tomato; $RUConfirm.ForeColor = [System.Drawing.Color]::White
+        $RUConfirm.Text = "确认删除勾选项"
         $RUConfirm.Location = New-Object System.Drawing.Point(560, 10); $RUConfirm.Size = New-Object System.Drawing.Size(120, 30)
         $RUConfirm.DialogResult = [System.Windows.Forms.DialogResult]::OK
         $RUBtnPanel.Controls.Add($RUConfirm)
+        Set-FrostBladeButtonStyle -Btn $RUConfirm -BackColor ([System.Drawing.Color]::FromArgb(220, 53, 69)) -ForeColor ([System.Drawing.Color]::White)
         $RUCancel = New-Object System.Windows.Forms.Button
         $RUCancel.Text = "跳过本项清理"; $RUCancel.Location = New-Object System.Drawing.Point(690, 10); $RUCancel.Size = New-Object System.Drawing.Size(110, 30)
         $RUCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
         $RUBtnPanel.Controls.Add($RUCancel)
+        Set-FrostBladeButtonStyle -Btn $RUCancel -BackColor ([System.Drawing.Color]::FromArgb(233, 236, 239)) -ForeColor ([System.Drawing.Color]::FromArgb(73, 80, 87))
         $RUForm.AcceptButton = $RUConfirm
         $RUForm.CancelButton = $RUCancel
 
@@ -2131,7 +2339,7 @@ if ($Silent) {
     }
 
     $CleanButton.Add_Click({
-        # --- ⓪.0 「所见即所得」校验：拦截"扫描完成后才勾选、还没重新扫描就点清理"的情况 ---
+        # --- 0.1 「所见即所得」校验：拦截"扫描完成后才勾选、还没重新扫描就点清理"的情况 ---
         # 这些项由于从未在勾选状态下被扫描引擎处理过，Paths 是空的，清理时只会静默跳过，
         # 用户却可能以为已经处理了——这里显式提醒并给出"取消去重新扫描"的机会。
         $staleNames = New-Object System.Collections.Generic.List[string]
@@ -2151,19 +2359,18 @@ if ($Silent) {
         if ($res -eq "Yes") {
             $Global:SyncHash.SkipVSSThisRun = $false
 
-            # --- ⓪ 残留目录（启发式识别）清理前逐项预览确认 ---
+            # --- 0.2 残留目录（启发式识别）清理前逐项预览确认 ---
             if ($Global:SyncHash.ScanItems["ResidualAppDirs"].Checked -and ($Global:PreviewRequiredKeys -contains "ResidualAppDirs")) {
                 Show-ResidualPreview
             }
 
-            # --- ⓪.2 注册表失效卸载项清理前逐项预览确认 ---
+            # --- 0.3 注册表失效卸载项清理前逐项预览确认 ---
             if ($Global:SyncHash.ScanItems["RegUninstall"].Checked -and ($Global:PreviewRequiredKeys -contains "RegUninstall")) {
                 Show-RegUninstallPreview
             }
 
-            # --- ⓪.5 还原点 与 VSSShadow(卷影/还原点清理) 冲突检测 ---
-            # VSSShadow 清理会删除全部卷影副本，若晚于还原点创建执行，会把刚创建的还原点一并销毁，
-            # 使"清理前自动创建还原点"这个保护动作失去意义，因此需要显式提醒并让用户选择。
+            # --- 0.4 还原点与 VSSShadow(卷影清理) 冲突检测 ---
+            # VSSShadow 会删除全部卷影副本，若晚于还原点创建执行会把刚创建的还原点一并销毁，需提醒用户选择。
             if ($RestorePointChk.Checked -and $Global:SyncHash.ScanItems["VSSShadow"].Checked) {
                 $vssWarn = [System.Windows.Forms.MessageBox]::Show(
                     "检测到同时勾选了『清理前自动创建系统还原点』和『系统还原点与卷影复制(VSSShadow)』清理项：`r`n`r`n" +
@@ -2174,13 +2381,11 @@ if ($Silent) {
                 elseif ($vssWarn -eq "Yes") { $Global:SyncHash.SkipVSSThisRun = $true }
             }
 
-            # --- ① 自动创建系统还原点 ---
+            # --- 1. 自动创建系统还原点（创建逻辑见全局函数 Invoke-PreCleanRestorePoint，供 GUI 与 -Silent 共用；这里只处理弹窗交互）---
             if ($RestorePointChk.Checked) {
                 $StatusLabel.Text = "正在创建系统还原点，请稍候（可能需要 20-60 秒）..."
                 $StatusLabel.ForeColor = [System.Drawing.Color]::DarkOrange
                 [System.Windows.Forms.Application]::DoEvents()
-                # [重构] 还原点创建逻辑已提取为全局函数 Invoke-PreCleanRestorePoint（供 GUI 与 -Silent 共用），
-                # 这里只保留 GUI 特有的弹窗交互。
                 $rpResult = Invoke-PreCleanRestorePoint
                 if (-not $rpResult.Success) {
                     # 常见原因：系统驱动器未启用还原保护、已被组策略禁用、24h 内已有还原点(Win10限频)
@@ -2194,9 +2399,8 @@ if ($Silent) {
                     [System.Windows.Forms.Application]::DoEvents()
                 }
             }
-            # --- ② 清理前自动关闭占用进程 ---
-            # [重构] 实际关闭逻辑已提取为全局函数 Invoke-PreCleanProcessTermination（供 GUI 与 -Silent 共用），
-            # 这里只保留 GUI 特有的"检测到哪些正在运行 -> 弹窗确认"交互，确认后才调用共用函数执行。
+            # --- 2. 清理前自动关闭占用进程（关闭逻辑见全局函数 Invoke-PreCleanProcessTermination，供 GUI 与 -Silent 共用；
+            #     这里只处理"检测到哪些正在运行 -> 弹窗确认"交互，确认后才调用共用函数执行）---
             if ($AutoCloseChk.Checked) {
                 $candidateNames = Get-PreCleanTargetProcessNames
                 if ($candidateNames.Count -gt 0) {
@@ -2248,9 +2452,7 @@ if ($Silent) {
         foreach ($o2 in $SizeOptions2) { [void]$SizeCombo2.Items.Add($o2.Text) }
         $SizeCombo2.SelectedIndex = 1
 
-        # [新增] 单独盘符扫描：索引0固定为"全部固定磁盘"（保留原有全盘行为），
-        # 后面按需追加当前机器上每个固定磁盘的盘符及容量，供用户按需只扫一个盘，
-        # 避免每次都要遍历全部磁盘、在多盘/大盘场景下浪费大量等待时间。
+        # 盘符筛选：索引0固定为"全部固定磁盘"，之后追加各固定磁盘盘符，避免每次都要遍历全盘。
         $DriveLabel2 = New-Object System.Windows.Forms.Label; $DriveLabel2.Text = "扫描范围:"; $DriveLabel2.Location = New-Object System.Drawing.Point(195,7); $DriveLabel2.Size = New-Object System.Drawing.Size(65,20); $TopPanel2.Controls.Add($DriveLabel2)
         $DriveCombo2 = New-Object System.Windows.Forms.ComboBox; $DriveCombo2.DropDownStyle = "DropDownList"; $DriveCombo2.Location = New-Object System.Drawing.Point(262,3); $DriveCombo2.Size = New-Object System.Drawing.Size(145,22); $TopPanel2.Controls.Add($DriveCombo2)
         [void]$DriveCombo2.Items.Add("全部固定磁盘")
@@ -2269,7 +2471,9 @@ if ($Silent) {
 
         $ExcludeChk2 = New-Object System.Windows.Forms.CheckBox; $ExcludeChk2.Text = "排除系统关键目录(推荐保留勾选)"; $ExcludeChk2.Checked = $true; $ExcludeChk2.Location = New-Object System.Drawing.Point(415,5); $ExcludeChk2.Size = New-Object System.Drawing.Size(230,20); $TopPanel2.Controls.Add($ExcludeChk2)
         $ScanBtn2 = New-Object System.Windows.Forms.Button; $ScanBtn2.Text = "开始扫描"; $ScanBtn2.Location = New-Object System.Drawing.Point(655,0); $ScanBtn2.Size = New-Object System.Drawing.Size(90,28); $TopPanel2.Controls.Add($ScanBtn2)
+        Set-FrostBladeButtonStyle -Btn $ScanBtn2 -BackColor ([System.Drawing.Color]::FromArgb(59, 130, 246)) -ForeColor ([System.Drawing.Color]::White)
         $CancelBtn2 = New-Object System.Windows.Forms.Button; $CancelBtn2.Text = "取消扫描"; $CancelBtn2.Location = New-Object System.Drawing.Point(750,0); $CancelBtn2.Size = New-Object System.Drawing.Size(90,28); $CancelBtn2.Enabled = $false; $TopPanel2.Controls.Add($CancelBtn2)
+        Set-FrostBladeButtonStyle -Btn $CancelBtn2 -BackColor ([System.Drawing.Color]::FromArgb(233, 236, 239)) -ForeColor ([System.Drawing.Color]::FromArgb(73, 80, 87))
 
         $StatusLabel2 = New-Object System.Windows.Forms.Label; $StatusLabel2.Text = "就绪。"; $StatusLabel2.Location = New-Object System.Drawing.Point(10,45); $StatusLabel2.Size = New-Object System.Drawing.Size(850,20); $StatusLabel2.ForeColor = [System.Drawing.Color]::DimGray; $LFForm.Controls.Add($StatusLabel2)
 
@@ -2354,13 +2558,15 @@ if ($Silent) {
         $BottomPanel2 = New-Object System.Windows.Forms.Panel; $BottomPanel2.Location = New-Object System.Drawing.Point(10,478); $BottomPanel2.Size = New-Object System.Drawing.Size(850,60); $LFForm.Controls.Add($BottomPanel2)
         $SelLabel2 = New-Object System.Windows.Forms.Label; $SelLabel2.Text = "已选择: 0 个文件，合计 0.00 MB"; $SelLabel2.Location = New-Object System.Drawing.Point(0,10); $SelLabel2.Size = New-Object System.Drawing.Size(300,20); $BottomPanel2.Controls.Add($SelLabel2)
         $SelAllBtn2 = New-Object System.Windows.Forms.Button; $SelAllBtn2.Text = "全选"; $SelAllBtn2.Location = New-Object System.Drawing.Point(310,5); $SelAllBtn2.Size = New-Object System.Drawing.Size(60,28); $BottomPanel2.Controls.Add($SelAllBtn2)
+        Set-FrostBladeButtonStyle -Btn $SelAllBtn2 -BackColor ([System.Drawing.Color]::FromArgb(233, 236, 239)) -ForeColor ([System.Drawing.Color]::FromArgb(73, 80, 87))
         $SelNoneBtn2 = New-Object System.Windows.Forms.Button; $SelNoneBtn2.Text = "全不选"; $SelNoneBtn2.Location = New-Object System.Drawing.Point(375,5); $SelNoneBtn2.Size = New-Object System.Drawing.Size(60,28); $BottomPanel2.Controls.Add($SelNoneBtn2)
-        # [新增] 大文件扫描器原来的删除是纯 Remove-Item -Force，不经回收站、无兜底，是全脚本里保护最弱的一条删除路径，
-        # 但它面向的恰恰是"大文件"这种最容易误删重要数据（视频、虚拟机镜像、数据库文件等）的场景。加一个默认勾选的
-        # "移入回收站"选项，用 Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile 的 SendToRecycleBin 选项实现，
-        # 误删了还能从回收站找回；用户主动取消勾选才会走回原来的永久删除。
+        Set-FrostBladeButtonStyle -Btn $SelNoneBtn2 -BackColor ([System.Drawing.Color]::FromArgb(233, 236, 239)) -ForeColor ([System.Drawing.Color]::FromArgb(73, 80, 87))
+        # 大文件面向的是最容易误删重要数据（视频/虚拟机镜像/数据库文件等）的场景，加一个默认勾选的
+        # "移入回收站"选项（Microsoft.VisualBasic.FileIO.FileSystem.DeleteFile 的 SendToRecycleBin），
+        # 误删了还能找回；取消勾选才走永久删除。
         $RecycleModeChk2 = New-Object System.Windows.Forms.CheckBox; $RecycleModeChk2.Text = "移入回收站(推荐)"; $RecycleModeChk2.Checked = $true; $RecycleModeChk2.Location = New-Object System.Drawing.Point(440,8); $RecycleModeChk2.Size = New-Object System.Drawing.Size(160,22); $BottomPanel2.Controls.Add($RecycleModeChk2)
-        $DeleteBtn2 = New-Object System.Windows.Forms.Button; $DeleteBtn2.Text = "删除选中项"; $DeleteBtn2.Font = New-Object System.Drawing.Font("微软雅黑", 9, [System.Drawing.FontStyle]::Bold); $DeleteBtn2.BackColor = [System.Drawing.Color]::Tomato; $DeleteBtn2.ForeColor = [System.Drawing.Color]::White; $DeleteBtn2.Location = New-Object System.Drawing.Point(620,3); $DeleteBtn2.Size = New-Object System.Drawing.Size(160,32); $BottomPanel2.Controls.Add($DeleteBtn2)
+        $DeleteBtn2 = New-Object System.Windows.Forms.Button; $DeleteBtn2.Text = "删除选中项"; $DeleteBtn2.Font = New-Object System.Drawing.Font("微软雅黑", 9, [System.Drawing.FontStyle]::Bold); $DeleteBtn2.Location = New-Object System.Drawing.Point(620,3); $DeleteBtn2.Size = New-Object System.Drawing.Size(160,32); $BottomPanel2.Controls.Add($DeleteBtn2)
+        Set-FrostBladeButtonStyle -Btn $DeleteBtn2 -BackColor ([System.Drawing.Color]::FromArgb(220, 53, 69)) -ForeColor ([System.Drawing.Color]::White)
 
         function Refresh-LFSelectionSummary {
             [long]$total2 = 0; $cnt2 = 0
@@ -2407,10 +2613,8 @@ if ($Silent) {
             $excludeSys2 = $ExcludeChk2.Checked
             $ListView2.Items.Clear()
 
-            # [新增] 索引0="全部固定磁盘"，沿用原有 Get-FixedDriveLetters 全量结果；
-            # 索引>=1说明用户选中了某个具体盘符，直接把 $drives2 换成该盘符的单元素数组即可——
-            # LargeFileScanBlock 内部本来就是对传入的 $Drives 数组做 foreach 逐盘遍历，天然支持"只传一个盘"，
-            # 不需要改动后台扫描脚本块本身。这里额外做一次防御：若枚举失败/盘符已拔出，回退到全盘扫描而不是直接报错。
+            # 索引0=全部固定磁盘；索引>=1时把 $drives2 换成该盘符的单元素数组即可，LargeFileScanBlock
+            # 内部本就对 $Drives 数组做 foreach 逐盘遍历。枚举失败/盘符已拔出时回退到全盘扫描而不报错。
             if ($DriveCombo2.SelectedIndex -le 0 -or $AllFixedDrives2.Count -eq 0) {
                 $drives2 = Get-FixedDriveLetters
                 $Global:LFSync.StatusMsg = "正在枚举固定磁盘..."
